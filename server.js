@@ -9,6 +9,11 @@ const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 3001;
 
+// Função auxiliar para formatar valores em Real brasileiro
+const formatarReal = (valor) => {
+  return valor.toFixed(2).replace('.', ',');
+};
+
 // Middlewares
 app.use(cors());
 app.use(express.json());
@@ -843,11 +848,11 @@ app.post('/api/pedido', async (req, res) => {
     
     detalhesItens.forEach((item, index) => {
       mensagem += `\n${index + 1}. *${item.nome}*\n`;
-      mensagem += `   Qtd: ${item.quantidade}x | R$ ${item.preco.toFixed(2)}\n`;
-      mensagem += `   Subtotal: R$ ${item.subtotal.toFixed(2)}\n`;
+      mensagem += `   Qtd: ${item.quantidade}x | R$ ${formatarReal(item.preco)}\n`;
+      mensagem += `   Subtotal: R$ ${formatarReal(item.subtotal)}\n`;
     });
     
-    mensagem += `\n💰 *TOTAL: R$ ${total.toFixed(2)}*`;
+    mensagem += `\n💰 *TOTAL: R$ ${formatarReal(total)}*`;
     
     if (observacoes) {
       mensagem += `\n\n📝 *Observações:* ${observacoes}`;
