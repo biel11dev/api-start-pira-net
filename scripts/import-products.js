@@ -22,7 +22,7 @@ async function importProducts() {
 
     // 2. Extrair todas as unidades de medida únicas
     const uniqueUnits = [...new Set(externalProducts.map(p => p.unit))];
-    console.log('📦 Criando unidades de medida...');
+    console.log('📦 Criando unidades de medida...'); 
     
     for (const unitName of uniqueUnits) {
       await prisma.unitMeasure.upsert({
