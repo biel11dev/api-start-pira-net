@@ -1017,11 +1017,14 @@ app.use((err, req, res, next) => {
 });
 
 // Iniciar servidor
-app.listen(PORT, () => {
-  console.log(`🚀 Servidor rodando na porta ${PORT}`);
-  console.log(`📱 API de Pedidos Online pronta!`);
-  console.log(`🗄️  Prisma conectado ao banco de dados`);
-});
+// Para desenvolvimento local
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`🚀 Servidor rodando na porta ${PORT}`);
+    console.log(`📱 API de Pedidos Online pronta!`);
+    console.log(`🗄️  Prisma conectado ao banco de dados`);
+  });
+}
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
@@ -1033,3 +1036,6 @@ process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   process.exit(0);
 });
+
+// Exportar o app para Vercel
+export default app;
