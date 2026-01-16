@@ -1,0 +1,110 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// Tabela de Categorias (para cardápio de lanchonete/delivery)
+model Category {
+  id             Int         @id @default(autoincrement())
+  name           String      @unique
+  parentId       Int?        // Campo para subcategoria
+  parent         Category?   @relation("CategorySubcategories", fields: [parentId], references: [id])
+  subcategories  Category[]  @relation("CategorySubcategories")
+  products       Product[]
+  
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+
+  @@map("categories")
+}
+
+// Tabela de Produtos (cardápio de produtos para venda)
+model Product {
+  id           Int       @id @default(autoincrement())
+  name         String
+  description  String?   // Descrição do produto
+  price        Float     // Preço de venda
+  image        String?   // Emoji ou URL da imagem
+  available    Boolean   @default(true) // Disponibilidade do produto
+  categoryId   Int?
+  category     Category? @relation(fields: [categoryId], references: [id])
+  
+  // Campos para controle de estoque (opcional)
+  quantity     Int?      // Quantidade em estoque
+  unit         String?   // Unidade de medida (kg, un, litro, etc)
+  costPrice    Float?    // Preço de custo
+  
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+  
+  orderItems   OrderItem[]
+
+  @@map("products")
+}
+
+// Tabela de Pedidos
+model Order {
+  id           Int         @id @default(autoincrement())
+  customerName String
+  customerPhone String?
+  customerAddress String?
+  observations String?
+  total        Float
+  status       String      @default("pending") // pending, confirmed, preparing, delivered, cancelled
+  
+  createdAt    DateTime    @default(now())
+  updatedAt    DateTime    @updatedAt
+  
+  items        OrderItem[]
+
+  @@map("orders")
+}
+
+// Tabela de Itens do Pedido
+model OrderItem {
+  id           Int       @id @default(autoincrement())
+  orderId      Int
+  order        Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  productId    Int
+  product      Product   @relation(fields: [productId], references: [id])
+  productName  String    // Nome do produto no momento da compra
+  quantity     Int
+  unitPrice    Float     // Preço unitário no momento da compra
+  subtotal     Float     // quantity * unitPrice
+  
+  createdAt    DateTime  @default(now())
+
+  @@map("order_items")
+}
+
+// Tabela de Sugestões/Destaques
+model Suggestion {
+  id           Int       @id @default(autoincrement())
+  productId    Int
+  reason       String    // "Mais vendido", "Novidade", "Promoção", etc
+  active       Boolean   @default(true)
+  order        Int       @default(0) // Ordem de exibição
+  
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@map("suggestions")
+}
+
+// Tabela de Unidades de Medida
+model UnitMeasure {
+  id           Int       @id @default(autoincrement())
+  name         String    @unique // Ex: "FD (12)", "Kg", "Litro", etc
+  abbreviation String?   // Abreviação opcional
+  description  String?   // Descrição da unidade
+  
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@map("unit_measures")
+}
+
