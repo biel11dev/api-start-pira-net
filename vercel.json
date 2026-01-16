@@ -11,9 +11,5 @@
       "src": "/(.*)",
       "dest": "server.js"
     }
-  ],
-  "env": {
-    "DATABASE_URL": "@database_url",
-    "WHATSAPP_NUMBER": "@whatsapp_number"
-  }
+  ]
 }
