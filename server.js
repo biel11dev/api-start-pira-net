@@ -9,11 +9,6 @@ const app = express();
 const prisma = new PrismaClient();
 const PORT = process.env.PORT || 3001;
 
-// Função auxiliar para formatar valores em Real brasileiro
-const formatarReal = (valor) => {
-  return valor.toFixed(2).replace('.', ',');
-};
-
 // Middlewares
 app.use(cors());
 app.use(express.json());
@@ -840,22 +835,22 @@ app.post('/api/pedido', async (req, res) => {
     });
     
     // Montar mensagem para WhatsApp
-    let mensagem = `*🛒 NOVO PEDIDO #${order.id}*\n\n`;
-    mensagem += `👤 *Cliente:* ${cliente.nome}\n`;
-    if (cliente.telefone) mensagem += `📱 *Telefone:* ${cliente.telefone}\n`;
-    if (cliente.endereco) mensagem += `📍 *Endereço:* ${cliente.endereco}\n`;
-    mensagem += `\n*📋 ITENS:*\n`;
+    let mensagem = `*NOVO PEDIDO #${order.id}*\n\n`;
+    mensagem += `*Cliente:* ${cliente.nome}\n`;
+    if (cliente.telefone) mensagem += `*Telefone:* ${cliente.telefone}\n`;
+    if (cliente.endereco) mensagem += `*Endereco:* ${cliente.endereco}\n`;
+    mensagem += `\n*ITENS DO PEDIDO:*\n`;
     
     detalhesItens.forEach((item, index) => {
       mensagem += `\n${index + 1}. *${item.nome}*\n`;
-      mensagem += `   Qtd: ${item.quantidade}x | R$ ${formatarReal(item.preco)}\n`;
-      mensagem += `   Subtotal: R$ ${formatarReal(item.subtotal)}\n`;
+      mensagem += `   Qtd: ${item.quantidade}x | R$ ${item.preco.toFixed(2)}\n`;
+      mensagem += `   Subtotal: R$ ${item.subtotal.toFixed(2)}\n`;
     });
     
-    mensagem += `\n💰 *TOTAL: R$ ${formatarReal(total)}*`;
+    mensagem += `\n*VALOR TOTAL: R$ ${total.toFixed(2)}*`;
     
     if (observacoes) {
-      mensagem += `\n\n📝 *Observações:* ${observacoes}`;
+      mensagem += `\n\n*Observacoes:* ${observacoes}`;
     }
     
     // Gerar link do WhatsApp
@@ -1015,6 +1010,95 @@ app.get('/health', (req, res) => {
   });
 });
 
+// ============================================
+// ROTAS DE SUGESTÕES DE MELHORIAS
+// ============================================
+
+// GET - Listar todas as sugestões
+app.get('/api/sugestoes-melhorias', async (req, res) => {
+  try {
+    const sugestoes = await prisma.sugestaoMelhoria.findMany({
+      orderBy: { votos: 'desc' }
+    });
+    res.json(sugestoes);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar sugestões', details: error.message });
+  }
+});
+
+// POST - Criar nova sugestão
+app.post('/api/sugestoes-melhorias', async (req, res) => {
+  try {
+    const { titulo, descricao, categoria } = req.body;
+    
+    if (!titulo || titulo.trim() === '') {
+      return res.status(400).json({ error: 'Título da sugestão é obrigatório' });
+    }
+
+    const sugestao = await prisma.sugestaoMelhoria.create({
+      data: {
+        titulo: titulo.trim(),
+        descricao: descricao?.trim() || '',
+        categoria: categoria?.trim() || 'Sugestão',
+        votos: 0
+      }
+    });
+    
+    res.status(201).json(sugestao);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao criar sugestão', details: error.message });
+  }
+});
+
+// PUT - Atualizar votos da sugestão
+app.put('/api/sugestoes-melhorias/:id/votar', async (req, res) => {
+  try {
+    const sugestaoId = parseInt(req.params.id);
+    const { incremento } = req.body; // +1 para votar, -1 para remover voto
+
+    if (isNaN(sugestaoId)) {
+      return res.status(400).json({ error: 'ID da sugestão inválido' });
+    }
+
+    const sugestaoAtual = await prisma.sugestaoMelhoria.findUnique({
+      where: { id: sugestaoId }
+    });
+
+    if (!sugestaoAtual) {
+      return res.status(404).json({ error: 'Sugestão não encontrada' });
+    }
+
+    const novosVotos = Math.max(0, sugestaoAtual.votos + (incremento || 0));
+
+    const sugestao = await prisma.sugestaoMelhoria.update({
+      where: { id: sugestaoId },
+      data: { votos: novosVotos }
+    });
+
+    res.json(sugestao);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao votar na sugestão', details: error.message });
+  }
+});
+
+// DELETE - Excluir sugestão
+app.delete('/api/sugestoes-melhorias/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) {
+      return res.status(400).json({ error: 'ID inválido' });
+    }
+
+    await prisma.sugestaoMelhoria.delete({ where: { id } });
+    res.json({ message: 'Sugestão excluída com sucesso' });
+  } catch (error) {
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Sugestão não encontrada' });
+    }
+    res.status(500).json({ error: 'Erro ao excluir sugestão', details: error.message });
+  }
+});
+
 // Middleware global de erro
 app.use((err, req, res, next) => {
   console.error('Erro:', err);
@@ -1022,14 +1106,11 @@ app.use((err, req, res, next) => {
 });
 
 // Iniciar servidor
-// Para desenvolvimento local
-if (process.env.NODE_ENV !== 'production') {
-  app.listen(PORT, () => {
-    console.log(`🚀 Servidor rodando na porta ${PORT}`);
-    console.log(`📱 API de Pedidos Online pronta!`);
-    console.log(`🗄️  Prisma conectado ao banco de dados`);
-  });
-}
+app.listen(PORT, () => {
+  console.log(`🚀 Servidor rodando na porta ${PORT}`);
+  console.log(`📱 API de Pedidos Online pronta!`);
+  console.log(`🗄️  Prisma conectado ao banco de dados`);
+});
 
 // Graceful shutdown
 process.on('SIGINT', async () => {
@@ -1041,6 +1122,3 @@ process.on('SIGTERM', async () => {
   await prisma.$disconnect();
   process.exit(0);
 });
-
-// Exportar o app para Vercel
-export default app;

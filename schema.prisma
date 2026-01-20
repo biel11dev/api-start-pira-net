@@ -108,3 +108,16 @@ model UnitMeasure {
   @@map("unit_measures")
 }
 
+// Tabela de Sugestões de Melhorias (Feedback dos clientes)
+model SugestaoMelhoria {
+  id           Int       @id @default(autoincrement())
+  titulo       String
+  descricao    String?   // Descrição detalhada
+  categoria    String    @default("Sugestão") // Sistema, Caixa, Integração, etc
+  votos        Int       @default(0) // Número de votos
+  
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  @@map("sugestoes_melhorias")
+}
