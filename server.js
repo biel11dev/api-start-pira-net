@@ -13,6 +13,84 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
+// Middleware de autenticação
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Token não fornecido' });
+  }
+
+  jwt.verify(token, JWT_SECRET, (err, user) => {
+    if (err) {
+      return res.status(403).json({ error: 'Token inválido' });
+    }
+    req.user = user;
+    next();
+  });
+};
+
+// ============================================
+// ROTAS DE AUTENTICAÇÃO
+// ============================================
+
+// POST - Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    // Validar credenciais (usuário hardcoded por enquanto)
+    // Em produção, buscar do banco de dados
+    const validUsers = [
+      {
+        id: 1,
+        email: 'admin@startpira.com',
+        password: await bcrypt.hash('admin123', 10), // Em produção, já deve estar hasheado no banco
+        name: 'Administrador'
+      }
+    ];
+
+    const user = validUsers.find(u => u.email === email);
+
+    if (!user) {
+      return res.status(401).json({ error: 'Email ou senha inválidos', message: 'Usuário não encontrado' });
+    }
+
+    // Verificar senha
+    const passwordMatch = await bcrypt.compare(password, user.password);
+
+    if (!passwordMatch) {
+      return res.status(401).json({ error: 'Email ou senha inválidos', message: 'Senha incorreta' });
+    }
+
+    // Gerar token JWT
+    const token = jwt.sign(
+      { id: user.id, email: user.email },
+      JWT_SECRET,
+      { expiresIn: '24h' }
+    );
+
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name
+      }
+    });
+  } catch (error) {
+    console.error('Erro no login:', error);
+    res.status(500).json({ error: 'Erro ao fazer login', details: error.message });
+  }
+});
+
+// GET - Verificar token
+app.get('/api/auth/me', authenticateToken, (req, res) => {
+  res.json({ user: req.user });
+});
+
+
 // ============================================
 // ROTAS DE UNIDADES DE MEDIDA
 // ============================================
