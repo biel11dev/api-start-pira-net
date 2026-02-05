@@ -14,7 +14,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
 
 // Middlewares
 app.use(cors());
-app.use(express.json());
+// Aumentar limite de payload para suportar imagens base64 (50MB)
+app.use(express.json({ limit: '50mb' }));
+app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
 // Middleware de autenticação
 const authenticateToken = (req, res, next) => {
@@ -1187,7 +1189,9 @@ app.delete('/api/sugestoes-melhorias/:id', async (req, res) => {
 // GET - Buscar todas as configurações
 app.get('/api/settings', async (req, res) => {
   try {
+    console.log('📥 Buscando configurações...');
     const settings = await prisma.settings.findMany();
+    console.log(`✅ Encontradas ${settings.length} configurações`);
     
     // Converter para formato objeto { key: value }
     const settingsObj = settings.reduce((acc, setting) => {
@@ -1197,7 +1201,12 @@ app.get('/api/settings', async (req, res) => {
     
     res.json(settingsObj);
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao buscar configurações', details: error.message });
+    console.error('❌ Erro ao buscar configurações:', error);
+    res.status(500).json({ 
+      error: 'Erro ao buscar configurações', 
+      details: error.message,
+      hint: 'Certifique-se de que executou: npx prisma generate && npx prisma migrate dev'
+    });
   }
 });
 
@@ -1221,15 +1230,20 @@ app.get('/api/settings/:key', async (req, res) => {
 // POST/PUT - Salvar ou atualizar múltiplas configurações
 app.post('/api/settings', async (req, res) => {
   try {
+    console.log('📥 Recebendo configurações para salvar...');
     const settingsData = req.body;
     
-    if (typeof settingsData !== 'object') {
+    if (!settingsData || typeof settingsData !== 'object') {
+      console.error('❌ Dados inválidos:', settingsData);
       return res.status(400).json({ error: 'Dados inválidos' });
     }
+
+    console.log('📝 Número de configurações a salvar:', Object.keys(settingsData).length);
 
     const updates = [];
     
     for (const [key, value] of Object.entries(settingsData)) {
+      console.log(`🔄 Processando configuração: ${key} (${value ? value.substring(0, 50) + '...' : 'vazio'})`);
       updates.push(
         prisma.settings.upsert({
           where: { key },
@@ -1239,8 +1253,10 @@ app.post('/api/settings', async (req, res) => {
       );
     }
     
+    console.log('💾 Salvando no banco de dados...');
     await Promise.all(updates);
     
+    console.log('✅ Configurações salvas com sucesso');
     const allSettings = await prisma.settings.findMany();
     const settingsObj = allSettings.reduce((acc, setting) => {
       acc[setting.key] = setting.value;
@@ -1249,7 +1265,12 @@ app.post('/api/settings', async (req, res) => {
     
     res.json(settingsObj);
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao salvar configurações', details: error.message });
+    console.error('❌ Erro ao salvar configurações:', error);
+    res.status(500).json({ 
+      error: 'Erro ao salvar configurações', 
+      details: error.message,
+      code: error.code 
+    });
   }
 });
 
