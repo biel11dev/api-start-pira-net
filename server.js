@@ -237,7 +237,6 @@ app.post('/api/import/products', async (req, res) => {
   try {
     const API_URL = 'https://api-start-pira.vercel.app/api';
     
-    console.log('🚀 Iniciando importação de produtos...');
     
     // Buscar produtos da API externa
     const response = await fetch(`${API_URL}/products`);
@@ -247,7 +246,6 @@ app.post('/api/import/products', async (req, res) => {
     }
 
     const externalProducts = await response.json();
-    console.log(`📥 ${externalProducts.length} produtos encontrados`);
     
     let importedCount = 0;
     let updatedCount = 0;
@@ -334,8 +332,6 @@ app.post('/api/import/products', async (req, res) => {
         });
       }
     }
-
-    console.log(`✅ Importação concluída: ${importedCount} novos, ${updatedCount} atualizados`);
 
     res.json({
       success: true,
@@ -1189,9 +1185,7 @@ app.delete('/api/sugestoes-melhorias/:id', async (req, res) => {
 // GET - Buscar todas as configurações
 app.get('/api/settings', async (req, res) => {
   try {
-    console.log('📥 Buscando configurações...');
     const settings = await prisma.settings.findMany();
-    console.log(`✅ Encontradas ${settings.length} configurações`);
     
     // Converter para formato objeto { key: value }
     const settingsObj = settings.reduce((acc, setting) => {
@@ -1230,7 +1224,6 @@ app.get('/api/settings/:key', async (req, res) => {
 // POST/PUT - Salvar ou atualizar múltiplas configurações
 app.post('/api/settings', async (req, res) => {
   try {
-    console.log('📥 Recebendo configurações para salvar...');
     const settingsData = req.body;
     
     if (!settingsData || typeof settingsData !== 'object') {
@@ -1238,12 +1231,10 @@ app.post('/api/settings', async (req, res) => {
       return res.status(400).json({ error: 'Dados inválidos' });
     }
 
-    console.log('📝 Número de configurações a salvar:', Object.keys(settingsData).length);
 
     const updates = [];
     
     for (const [key, value] of Object.entries(settingsData)) {
-      console.log(`🔄 Processando configuração: ${key} (${value ? value.substring(0, 50) + '...' : 'vazio'})`);
       updates.push(
         prisma.settings.upsert({
           where: { key },
@@ -1253,10 +1244,8 @@ app.post('/api/settings', async (req, res) => {
       );
     }
     
-    console.log('💾 Salvando no banco de dados...');
     await Promise.all(updates);
     
-    console.log('✅ Configurações salvas com sucesso');
     const allSettings = await prisma.settings.findMany();
     const settingsObj = allSettings.reduce((acc, setting) => {
       acc[setting.key] = setting.value;
@@ -1265,7 +1254,6 @@ app.post('/api/settings', async (req, res) => {
     
     res.json(settingsObj);
   } catch (error) {
-    console.error('❌ Erro ao salvar configurações:', error);
     res.status(500).json({ 
       error: 'Erro ao salvar configurações', 
       details: error.message,
