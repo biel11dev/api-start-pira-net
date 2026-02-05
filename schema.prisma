@@ -121,3 +121,16 @@ model SugestaoMelhoria {
 
   @@map("sugestoes_melhorias")
 }
+
+// Tabela de Configurações do Site
+model Settings {
+  id              Int       @id @default(autoincrement())
+  key             String    @unique // Chave única da configuração (ex: "banner_image", "store_name")
+  value           String?   @db.Text // Valor da configuração (pode ser texto longo para base64)
+  description     String?   // Descrição da configuração
+  
+  createdAt       DateTime  @default(now())
+  updatedAt       DateTime  @updatedAt
+
+  @@map("settings")
+}

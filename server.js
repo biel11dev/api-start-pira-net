@@ -1180,6 +1180,120 @@ app.delete('/api/sugestoes-melhorias/:id', async (req, res) => {
   }
 });
 
+// ============================================
+// ROTAS DE CONFIGURAÇÕES
+// ============================================
+
+// GET - Buscar todas as configurações
+app.get('/api/settings', async (req, res) => {
+  try {
+    const settings = await prisma.settings.findMany();
+    
+    // Converter para formato objeto { key: value }
+    const settingsObj = settings.reduce((acc, setting) => {
+      acc[setting.key] = setting.value;
+      return acc;
+    }, {});
+    
+    res.json(settingsObj);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar configurações', details: error.message });
+  }
+});
+
+// GET - Buscar configuração específica por chave
+app.get('/api/settings/:key', async (req, res) => {
+  try {
+    const setting = await prisma.settings.findUnique({
+      where: { key: req.params.key }
+    });
+    
+    if (!setting) {
+      return res.status(404).json({ error: 'Configuração não encontrada' });
+    }
+    
+    res.json({ key: setting.key, value: setting.value });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar configuração', details: error.message });
+  }
+});
+
+// POST/PUT - Salvar ou atualizar múltiplas configurações
+app.post('/api/settings', async (req, res) => {
+  try {
+    const settingsData = req.body;
+    
+    if (typeof settingsData !== 'object') {
+      return res.status(400).json({ error: 'Dados inválidos' });
+    }
+
+    const updates = [];
+    
+    for (const [key, value] of Object.entries(settingsData)) {
+      updates.push(
+        prisma.settings.upsert({
+          where: { key },
+          update: { value: value || '' },
+          create: { key, value: value || '' }
+        })
+      );
+    }
+    
+    await Promise.all(updates);
+    
+    const allSettings = await prisma.settings.findMany();
+    const settingsObj = allSettings.reduce((acc, setting) => {
+      acc[setting.key] = setting.value;
+      return acc;
+    }, {});
+    
+    res.json(settingsObj);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao salvar configurações', details: error.message });
+  }
+});
+
+// PUT - Atualizar configuração específica
+app.put('/api/settings/:key', async (req, res) => {
+  try {
+    const { value, description } = req.body;
+    const key = req.params.key;
+
+    const setting = await prisma.settings.upsert({
+      where: { key },
+      update: { 
+        value: value || '',
+        description: description || null
+      },
+      create: { 
+        key, 
+        value: value || '',
+        description: description || null
+      }
+    });
+
+    res.json(setting);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao atualizar configuração', details: error.message });
+  }
+});
+
+// DELETE - Excluir configuração
+app.delete('/api/settings/:key', async (req, res) => {
+  try {
+    await prisma.settings.delete({
+      where: { key: req.params.key }
+    });
+    
+    res.json({ message: 'Configuração excluída com sucesso' });
+  } catch (error) {
+    if (error.code === 'P2025') {
+      return res.status(404).json({ error: 'Configuração não encontrada' });
+    }
+    res.status(500).json({ error: 'Erro ao excluir configuração', details: error.message });
+  }
+});
+
 // Middleware global de erro
 app.use((err, req, res, next) => {
   console.error('Erro:', err);
