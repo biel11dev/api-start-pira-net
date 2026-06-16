@@ -640,44 +640,42 @@ app.get('/api/cardapio', async (req, res) => {
 // INTEGRAÇÃO COM SISTEMA INTERNO (QA) - PRODUTOS POR COMPONENTES / ESTOQUE / VENDAS
 // ============================================
 
-// Converte um item de estoque do QA para o formato de produto do cardápio público
-const mapearProdutoQA = (item, imageMap = {}) => ({
-  id: item.id, // estoqueId
-  name: item.name,
-  description: imageMap[item.name?.toLowerCase()?.trim()]?.description || '',
-  price: item.value,
-  image: imageMap[item.name?.toLowerCase()?.trim()]?.image || '',
-  available: item.quantity > 0,
-  unit: item.unit,
-  quantity: item.quantity,
-  productId: item.productId,
-  composicoes: (item.composicoes || []).map(c => ({
-    id: c.id,
-    nome: c.nome,
-    descricao: c.descricao,
-    obrigatorio: c.obrigatorio,
-    multiplo: c.multiplo,
-    minOpcoes: c.minOpcoes,
-    maxOpcoes: c.maxOpcoes,
-    ordem: c.ordem,
-    opcoes: (c.opcoes || [])
-      .filter(o => o.disponivel)
-      .map(o => ({
-        id: o.id,
-        nome: o.nome,
-        valorExtra: o.valorExtra,
-        disponivel: o.disponivel,
-        estoqueId: o.estoqueId
-      }))
-  }))
-});
+// Converte as composições (componentes) de um item de estoque do QA
+const mapearComposicoes = (item) => (item.composicoes || []).map(c => ({
+  id: c.id,
+  nome: c.nome,
+  descricao: c.descricao,
+  obrigatorio: c.obrigatorio,
+  multiplo: c.multiplo,
+  minOpcoes: c.minOpcoes,
+  maxOpcoes: c.maxOpcoes,
+  ordem: c.ordem,
+  opcoes: (c.opcoes || [])
+    .filter(o => o.disponivel)
+    .map(o => ({
+      id: o.id,
+      nome: o.nome,
+      valorExtra: o.valorExtra,
+      disponivel: o.disponivel,
+      estoqueId: o.estoqueId
+    }))
+}));
 
-// Agrupa os itens vendáveis do QA na hierarquia categoria > subcategoria
+// Agrupa os itens vendáveis do QA em produtos (por productId) com variações de unidade,
+// dentro da hierarquia categoria > subcategoria
 const agruparCardapioQA = (estoqueItems, imageMap = {}) => {
   // Excluir itens que são apenas componentes de composição (vinculados via composicaoOpcoes)
   const vendiveis = estoqueItems.filter(p => !(p._count?.composicaoOpcoes > 0));
-  const parentsMap = new Map();
 
+  // Agrupar itens de estoque pelo mesmo productId (mesmo produto, unidades diferentes)
+  const produtoGroups = new Map();
+  for (const item of vendiveis) {
+    const gKey = item.productId != null ? `prod-${item.productId}` : `solo-${item.id}`;
+    if (!produtoGroups.has(gKey)) produtoGroups.set(gKey, []);
+    produtoGroups.get(gKey).push(item);
+  }
+
+  const parentsMap = new Map();
   const getParent = (id, name) => {
     const key = id != null ? `c${id}` : 'outros';
     if (!parentsMap.has(key)) {
@@ -686,9 +684,27 @@ const agruparCardapioQA = (estoqueItems, imageMap = {}) => {
     return parentsMap.get(key);
   };
 
-  for (const item of vendiveis) {
-    const produto = mapearProdutoQA(item, imageMap);
-    const cat = item.category;
+  for (const [gKey, items] of produtoGroups) {
+    const first = items[0];
+    const img = imageMap[first.name?.toLowerCase()?.trim()] || {};
+    const produto = {
+      groupId: gKey,
+      productId: first.productId ?? null,
+      name: first.name,
+      description: img.description || '',
+      image: img.image || '',
+      available: items.some(it => it.quantity > 0),
+      variacoes: items.map(it => ({
+        estoqueId: it.id,
+        unit: it.unit,
+        price: it.value,
+        quantity: it.quantity,
+        available: it.quantity > 0,
+        composicoes: mapearComposicoes(it)
+      }))
+    };
+
+    const cat = first.category;
     if (cat && cat.parent) {
       const parent = getParent(cat.parent.id, cat.parent.name);
       const subKey = `s${cat.id}`;
