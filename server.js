@@ -12,6 +12,9 @@ const prisma = new PrismaClient();
 const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
 
+// URL do sistema interno (fonte da verdade: produtos por componentes, estoque e vendas)
+const QA_API_URL = process.env.QA_API_URL || 'https://api-start-pira-qa.vercel.app';
+
 // Middlewares
 app.use(cors());
 // Aumentar limite de payload para suportar imagens base64 (50MB)
@@ -630,6 +633,201 @@ app.get('/api/cardapio', async (req, res) => {
     res.json(cardapio);
   } catch (error) {
     res.status(500).json({ error: 'Erro ao buscar cardápio', details: error.message });
+  }
+});
+
+// ============================================
+// INTEGRAÇÃO COM SISTEMA INTERNO (QA) - PRODUTOS POR COMPONENTES / ESTOQUE / VENDAS
+// ============================================
+
+// Converte um item de estoque do QA para o formato de produto do cardápio público
+const mapearProdutoQA = (item, imageMap = {}) => ({
+  id: item.id, // estoqueId
+  name: item.name,
+  description: imageMap[item.name?.toLowerCase()?.trim()]?.description || '',
+  price: item.value,
+  image: imageMap[item.name?.toLowerCase()?.trim()]?.image || '',
+  available: item.quantity > 0,
+  unit: item.unit,
+  quantity: item.quantity,
+  productId: item.productId,
+  composicoes: (item.composicoes || []).map(c => ({
+    id: c.id,
+    nome: c.nome,
+    descricao: c.descricao,
+    obrigatorio: c.obrigatorio,
+    multiplo: c.multiplo,
+    minOpcoes: c.minOpcoes,
+    maxOpcoes: c.maxOpcoes,
+    ordem: c.ordem,
+    opcoes: (c.opcoes || [])
+      .filter(o => o.disponivel)
+      .map(o => ({
+        id: o.id,
+        nome: o.nome,
+        valorExtra: o.valorExtra,
+        disponivel: o.disponivel,
+        estoqueId: o.estoqueId
+      }))
+  }))
+});
+
+// Agrupa os itens vendáveis do QA na hierarquia categoria > subcategoria
+const agruparCardapioQA = (estoqueItems, imageMap = {}) => {
+  // Excluir itens que são apenas componentes de composição (vinculados via composicaoOpcoes)
+  const vendiveis = estoqueItems.filter(p => !(p._count?.composicaoOpcoes > 0));
+  const parentsMap = new Map();
+
+  const getParent = (id, name) => {
+    const key = id != null ? `c${id}` : 'outros';
+    if (!parentsMap.has(key)) {
+      parentsMap.set(key, { id: id != null ? id : 'outros', name, products: [], subMap: new Map() });
+    }
+    return parentsMap.get(key);
+  };
+
+  for (const item of vendiveis) {
+    const produto = mapearProdutoQA(item, imageMap);
+    const cat = item.category;
+    if (cat && cat.parent) {
+      const parent = getParent(cat.parent.id, cat.parent.name);
+      const subKey = `s${cat.id}`;
+      if (!parent.subMap.has(subKey)) {
+        parent.subMap.set(subKey, { id: cat.id, name: cat.name, products: [] });
+      }
+      parent.subMap.get(subKey).products.push(produto);
+    } else if (cat) {
+      getParent(cat.id, cat.name).products.push(produto);
+    } else {
+      getParent(null, 'Outros').products.push(produto);
+    }
+  }
+
+  return Array.from(parentsMap.values()).map(p => ({
+    id: p.id,
+    name: p.name,
+    products: p.products,
+    subcategories: Array.from(p.subMap.values())
+  }));
+};
+
+// Monta um mapa nome(produto) -> { image, description } a partir do catálogo local do net
+const carregarImagensLocais = async () => {
+  const imageMap = {};
+  try {
+    const produtosNet = await prisma.product.findMany({
+      select: { name: true, image: true, description: true }
+    });
+    for (const p of produtosNet) {
+      if (!p.name) continue;
+      imageMap[p.name.toLowerCase().trim()] = {
+        image: p.image || '',
+        description: p.description || ''
+      };
+    }
+  } catch (error) {
+    console.error('Não foi possível carregar imagens locais:', error.message);
+  }
+  return imageMap;
+};
+
+// GET - Cardápio público consumindo o sistema interno (produtos por componentes)
+app.get('/api/cardapio-qa', async (req, res) => {
+  try {
+    const [response, imageMap] = await Promise.all([
+      fetch(`${QA_API_URL}/api/estoque_prod`),
+      carregarImagensLocais()
+    ]);
+    if (!response.ok) {
+      return res.status(502).json({ error: 'Não foi possível obter o cardápio do sistema interno' });
+    }
+    const estoque = await response.json();
+    res.json(agruparCardapioQA(estoque, imageMap));
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao buscar cardápio do sistema interno', details: error.message });
+  }
+});
+
+// POST - Registrar pedido público como venda no sistema interno (baixa estoque)
+app.post('/api/pedido-qa', async (req, res) => {
+  try {
+    const { cliente, itens, observacoes } = req.body;
+
+    if (!cliente || !cliente.nome || !Array.isArray(itens) || itens.length === 0) {
+      return res.status(400).json({ error: 'Dados incompletos' });
+    }
+
+    const items = itens.map(i => ({
+      id: i.id, // estoqueId
+      name: i.name,
+      price: Number(i.price),
+      quantity: Number(i.quantity),
+      unit: i.unit,
+      ...(i.composicao ? { composicao: i.composicao } : {}),
+      ...(i.composicaoLabel ? { composicaoLabel: i.composicaoLabel } : {})
+    }));
+
+    const total = items.reduce((soma, i) => soma + i.price * i.quantity, 0);
+
+    const saleData = {
+      items,
+      total,
+      paymentMethod: 'Pedido Online',
+      customerName: cliente.nome,
+      amountReceived: total,
+      change: 0,
+      date: new Date().toISOString(),
+      discount: null,
+      splitPayments: null,
+      pendente: null,
+      vale: null,
+      subtotal: total,
+      finalTotal: total
+    };
+
+    const qaRes = await fetch(`${QA_API_URL}/api/sales`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(saleData)
+    });
+    const data = await qaRes.json();
+
+    if (!qaRes.ok) {
+      return res.status(qaRes.status).json({
+        error: data.error || 'Erro ao registrar pedido no sistema interno'
+      });
+    }
+
+    // Montar mensagem para WhatsApp
+    let mensagem = `*NOVO PEDIDO #${data.id}*\n\n`;
+    mensagem += `*Cliente:* ${cliente.nome}\n`;
+    if (cliente.telefone) mensagem += `*Telefone:* ${cliente.telefone}\n`;
+    if (cliente.endereco) mensagem += `*Endereco:* ${cliente.endereco}\n`;
+    mensagem += `\n*ITENS DO PEDIDO:*\n`;
+
+    items.forEach((item, index) => {
+      mensagem += `\n${index + 1}. *${item.name}*\n`;
+      if (item.composicaoLabel) mensagem += `   ${item.composicaoLabel}\n`;
+      mensagem += `   Qtd: ${item.quantity}x | R$ ${item.price.toFixed(2)}\n`;
+      mensagem += `   Subtotal: R$ ${(item.price * item.quantity).toFixed(2)}\n`;
+    });
+
+    mensagem += `\n*VALOR TOTAL: R$ ${total.toFixed(2)}*`;
+    if (observacoes) mensagem += `\n\n*Observacoes:* ${observacoes}`;
+
+    const telefoneEmpresa = process.env.WHATSAPP_NUMBER || '5511999999999';
+    const whatsappLink = `https://wa.me/${telefoneEmpresa}?text=${encodeURIComponent(mensagem)}`;
+
+    res.json({
+      success: true,
+      orderId: data.id,
+      saleId: data.id,
+      total,
+      whatsappLink,
+      mensagem
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao registrar pedido no sistema interno', details: error.message });
   }
 });
 
