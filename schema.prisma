@@ -54,8 +54,15 @@ model Order {
   customerAddress String?
   observations String?
   total        Float
-  status       String      @default("pending") // pending, confirmed, preparing, delivered, cancelled
-  
+  status       String      @default("pending") // pending, ready, out_for_delivery, delivered, cancelled
+
+  // Pagamento (Mercado Pago PIX)
+  paymentMethod  String?   // ex: "pix"
+  paymentId      String?   // id do pagamento no Mercado Pago
+  paymentStatus  String?   // pending, approved, rejected, cancelled, expired
+  qaSaleId       String?   // id da venda registrada no sistema interno (QA) apos pagamento
+  cartSnapshot   Json?     // itens/cliente para registrar a venda no QA apos o pagamento
+
   createdAt    DateTime    @default(now())
   updatedAt    DateTime    @updatedAt
   

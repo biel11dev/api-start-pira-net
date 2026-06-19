@@ -15,6 +15,12 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
 // URL do sistema interno (fonte da verdade: produtos por componentes, estoque e vendas)
 const QA_API_URL = process.env.QA_API_URL || 'https://api-start-pira-qa.vercel.app';
 
+// ===== Mercado Pago (PIX) =====
+const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
+const MP_API_URL = 'https://api.mercadopago.com';
+const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${process.env.PORT || 3001}`).replace(/\/$/, '');
+const PIX_EXPIRACAO_MINUTOS = Number(process.env.PIX_EXPIRACAO_MINUTOS) || 30;
+
 // Middlewares
 app.use(cors());
 // Aumentar limite de payload para suportar imagens base64 (50MB)
@@ -747,6 +753,230 @@ const carregarImagensLocais = async () => {
   return imageMap;
 };
 
+// Resolve o productId local do net por nome; se não existir, cria um produto-espelho oculto
+// (necessário porque OrderItem do net referencia Product por FK obrigatória)
+const resolverProdutoLocal = async (nome, preco) => {
+  const existente = await prisma.product.findFirst({
+    where: { name: nome },
+    select: { id: true }
+  });
+  if (existente) return existente.id;
+
+  const criado = await prisma.product.create({
+    data: {
+      name: nome,
+      price: Number(preco) || 0,
+      available: false, // oculto: o cardápio público vem do sistema interno (QA)
+      description: 'Item de pedido online (sistema interno)'
+    },
+    select: { id: true }
+  });
+  return criado.id;
+};
+
+// ====== FOLLOW-UP DE STATUS DO PEDIDO (mensagens por etapa) ======
+
+// Status válidos e seus rótulos (PT-BR)
+const ORDER_STATUS_LABELS = {
+  pending: 'Pendente',
+  ready: 'Pronto',
+  out_for_delivery: 'Saiu para entrega',
+  delivered: 'Entregue',
+  cancelled: 'Cancelado',
+  // compatibilidade com pedidos antigos
+  confirmed: 'Confirmado',
+  preparing: 'Preparando'
+};
+
+// Normaliza telefone para o formato aceito pelo link wa.me (apenas dígitos, com DDI 55 para BR)
+const normalizarTelefone = (telefone) => {
+  if (!telefone) return null;
+  let digitos = String(telefone).replace(/\D/g, '');
+  if (!digitos) return null;
+  // Se não começa com código do país e tem 10-11 dígitos (DDD + número), assume Brasil (55)
+  if (digitos.length <= 11) digitos = `55${digitos}`;
+  return digitos;
+};
+
+// Monta a mensagem de follow-up enviada ao cliente conforme a etapa do pedido
+const montarMensagemStatus = (order, status) => {
+  const nome = order.customerName || 'cliente';
+  const pedido = `#${order.id}`;
+  const mensagens = {
+    pending: `Olá, ${nome}! 😊 Recebemos o seu pedido ${pedido} e já estamos cuidando dele. Em breve avisamos as próximas etapas!`,
+    ready: `Boa notícia, ${nome}! ✅ Seu pedido ${pedido} está *pronto*!`,
+    out_for_delivery: `${nome}, seu pedido ${pedido} *saiu para entrega* e logo chega até você! 🛵💨`,
+    delivered: `Pedido ${pedido} *entregue*! 🎉 Obrigado pela preferência, ${nome}. Bom apetite!`,
+    cancelled: `${nome}, infelizmente seu pedido ${pedido} foi *cancelado*. Em caso de dúvidas, fale com a gente.`
+  };
+  return mensagens[status] || `Atualização do seu pedido ${pedido}: ${ORDER_STATUS_LABELS[status] || status}.`;
+};
+
+// Gera o link wa.me de follow-up para o cliente (ou null se não houver telefone)
+const gerarLinkFollowUp = (order, status) => {
+  const telefone = normalizarTelefone(order.customerPhone);
+  const mensagem = montarMensagemStatus(order, status);
+  if (!telefone) return { link: null, mensagem, hasPhone: false };
+  return {
+    link: `https://wa.me/${telefone}?text=${encodeURIComponent(mensagem)}`,
+    mensagem,
+    hasPhone: true
+  };
+};
+
+// ====== PAGAMENTO PIX (MERCADO PAGO) ======
+
+// Normaliza os itens recebidos do frontend para o formato interno
+const normalizarItensPedido = (itens) => (itens || []).map((i) => ({
+  id: i.id, // estoqueId
+  name: i.name,
+  price: Number(i.price),
+  quantity: Number(i.quantity),
+  unit: i.unit,
+  ...(i.composicao ? { composicao: i.composicao } : {}),
+  ...(i.composicaoLabel ? { composicaoLabel: i.composicaoLabel } : {})
+}));
+
+// Registra a venda no sistema interno (QA) — dá baixa no estoque.
+// Retorna { ok, status, data }.
+const registrarVendaQA = async (items, total, cliente, _observacoes) => {
+  const saleData = {
+    items,
+    total,
+    paymentMethod: 'PIX (Mercado Pago)',
+    customerName: cliente?.nome || 'Cliente',
+    amountReceived: total,
+    change: 0,
+    date: new Date().toISOString(),
+    discount: null,
+    splitPayments: null,
+    pendente: null,
+    vale: null,
+    subtotal: total,
+    finalTotal: total
+  };
+
+  const qaRes = await fetch(`${QA_API_URL}/api/sales`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(saleData)
+  });
+  const data = await qaRes.json().catch(() => ({}));
+  return { ok: qaRes.ok, status: qaRes.status, data };
+};
+
+// Cria um pagamento PIX no Mercado Pago. Retorna o pagamento criado.
+const criarPagamentoPixMP = async ({ total, descricao, externalReference, payer }) => {
+  if (!MP_ACCESS_TOKEN) {
+    throw new Error('MP_ACCESS_TOKEN não configurado no .env');
+  }
+
+  const expiracao = new Date(Date.now() + PIX_EXPIRACAO_MINUTOS * 60 * 1000);
+
+  const body = {
+    transaction_amount: Number(total.toFixed(2)),
+    description: descricao,
+    payment_method_id: 'pix',
+    external_reference: String(externalReference),
+    notification_url: `${PUBLIC_API_URL}/api/webhooks/mercadopago`,
+    date_of_expiration: expiracao.toISOString().replace('Z', '-00:00'),
+    payer: {
+      email: payer?.email || 'cliente@startpira.com.br',
+      first_name: payer?.first_name || 'Cliente'
+    }
+  };
+
+  const resp = await fetch(`${MP_API_URL}/v1/payments`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
+      'X-Idempotency-Key': `order-${externalReference}-${Date.now()}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg = data?.message || data?.error || 'Erro ao criar pagamento PIX';
+    const err = new Error(msg);
+    err.details = data;
+    throw err;
+  }
+  return data;
+};
+
+// Consulta um pagamento no Mercado Pago pelo id.
+const consultarPagamentoMP = async (paymentId) => {
+  const resp = await fetch(`${MP_API_URL}/v1/payments/${paymentId}`, {
+    headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const err = new Error(data?.message || 'Erro ao consultar pagamento');
+    err.details = data;
+    throw err;
+  }
+  return data;
+};
+
+// Monta a mensagem do pedido para o WhatsApp da empresa (notificação após pagamento)
+const gerarLinkEmpresa = (order) => {
+  const snapshot = order.cartSnapshot || {};
+  const items = snapshot.itens || [];
+  const cliente = snapshot.cliente || { nome: order.customerName, telefone: order.customerPhone, endereco: order.customerAddress };
+  const total = order.total;
+
+  let mensagem = `*PEDIDO PAGO (PIX) #${order.id}*\n\n`;
+  mensagem += `*Cliente:* ${cliente.nome || order.customerName}\n`;
+  if (cliente.telefone || order.customerPhone) mensagem += `*Telefone:* ${cliente.telefone || order.customerPhone}\n`;
+  if (cliente.endereco || order.customerAddress) mensagem += `*Endereco:* ${cliente.endereco || order.customerAddress}\n`;
+  mensagem += `\n*ITENS DO PEDIDO:*\n`;
+
+  items.forEach((item, index) => {
+    mensagem += `\n${index + 1}. *${item.name}*\n`;
+    if (item.composicaoLabel) mensagem += `   ${item.composicaoLabel}\n`;
+    mensagem += `   Qtd: ${item.quantity}x | R$ ${Number(item.price).toFixed(2)}\n`;
+    mensagem += `   Subtotal: R$ ${(Number(item.price) * Number(item.quantity)).toFixed(2)}\n`;
+  });
+
+  mensagem += `\n*VALOR TOTAL: R$ ${Number(total).toFixed(2)}*`;
+  mensagem += `\n\n✅ *Pagamento confirmado via PIX (Mercado Pago)*`;
+  if (snapshot.observacoes || order.observations) mensagem += `\n\n*Observacoes:* ${snapshot.observacoes || order.observations}`;
+
+  const telefoneEmpresa = process.env.WHATSAPP_NUMBER || '5511999999999';
+  return `https://wa.me/${telefoneEmpresa}?text=${encodeURIComponent(mensagem)}`;
+};
+
+// Processa um pagamento aprovado: registra a venda no QA (baixa estoque) de forma idempotente.
+// Retorna o Order atualizado.
+const processarPagamentoAprovado = async (order) => {
+  if (order.qaSaleId) return order;
+
+  const snapshot = order.cartSnapshot || {};
+  const items = snapshot.itens || [];
+  const cliente = snapshot.cliente || { nome: order.customerName };
+  const total = order.total;
+
+  const venda = await registrarVendaQA(items, total, cliente, snapshot.observacoes);
+  if (!venda.ok) {
+    console.error('Falha ao registrar venda no QA após pagamento aprovado:', venda.data);
+    // Marca como pago, mas sinaliza que a venda interna falhou (precisa atenção manual).
+    return prisma.order.update({
+      where: { id: order.id },
+      data: { paymentStatus: 'approved' }
+    });
+  }
+
+  return prisma.order.update({
+    where: { id: order.id },
+    data: {
+      paymentStatus: 'approved',
+      qaSaleId: String(venda.data?.id ?? ''),
+    }
+  });
+};
+
 // GET - Cardápio público consumindo o sistema interno (produtos por componentes)
 app.get('/api/cardapio-qa', async (req, res) => {
   try {
@@ -814,8 +1044,38 @@ app.post('/api/pedido-qa', async (req, res) => {
       });
     }
 
+    // Criar um Order no net para rastrear o status do pedido e fazer follow-up por WhatsApp
+    let netOrder = null;
+    try {
+      const orderItems = [];
+      for (const item of items) {
+        const productId = await resolverProdutoLocal(item.name, item.price);
+        orderItems.push({
+          productId,
+          productName: item.composicaoLabel ? `${item.name} — ${item.composicaoLabel}` : item.name,
+          quantity: item.quantity,
+          unitPrice: item.price,
+          subtotal: item.price * item.quantity
+        });
+      }
+
+      netOrder = await prisma.order.create({
+        data: {
+          customerName: cliente.nome,
+          customerPhone: cliente.telefone || null,
+          customerAddress: cliente.endereco || null,
+          observations: observacoes || null,
+          total,
+          status: 'pending',
+          items: { create: orderItems }
+        }
+      });
+    } catch (orderErr) {
+      console.error('Não foi possível criar o Order de rastreamento no net:', orderErr.message);
+    }
+
     // Montar mensagem para WhatsApp
-    let mensagem = `*NOVO PEDIDO #${data.id}*\n\n`;
+    let mensagem = `*NOVO PEDIDO #${netOrder?.id ?? data.id}*\n\n`;
     mensagem += `*Cliente:* ${cliente.nome}\n`;
     if (cliente.telefone) mensagem += `*Telefone:* ${cliente.telefone}\n`;
     if (cliente.endereco) mensagem += `*Endereco:* ${cliente.endereco}\n`;
@@ -836,7 +1096,7 @@ app.post('/api/pedido-qa', async (req, res) => {
 
     res.json({
       success: true,
-      orderId: data.id,
+      orderId: netOrder?.id ?? data.id,
       saleId: data.id,
       total,
       whatsappLink,
@@ -844,6 +1104,168 @@ app.post('/api/pedido-qa', async (req, res) => {
     });
   } catch (error) {
     res.status(500).json({ error: 'Erro ao registrar pedido no sistema interno', details: error.message });
+  }
+});
+
+// POST - Criar cobrança PIX (Mercado Pago). NÃO dá baixa no estoque ainda.
+app.post('/api/pagamento-pix', async (req, res) => {
+  try {
+    const { cliente, itens, observacoes, payer } = req.body;
+
+    if (!cliente || !cliente.nome || !Array.isArray(itens) || itens.length === 0) {
+      return res.status(400).json({ error: 'Dados incompletos' });
+    }
+
+    const items = normalizarItensPedido(itens);
+    const total = items.reduce((soma, i) => soma + i.price * i.quantity, 0);
+
+    if (!(total > 0)) {
+      return res.status(400).json({ error: 'Valor total inválido' });
+    }
+
+    // Cria o pedido no net com status pendente, guardando o snapshot do carrinho
+    // para registrar a venda no QA somente após o pagamento ser aprovado.
+    const orderItems = [];
+    for (const item of items) {
+      const productId = await resolverProdutoLocal(item.name, item.price);
+      orderItems.push({
+        productId,
+        productName: item.composicaoLabel ? `${item.name} — ${item.composicaoLabel}` : item.name,
+        quantity: item.quantity,
+        unitPrice: item.price,
+        subtotal: item.price * item.quantity
+      });
+    }
+
+    const order = await prisma.order.create({
+      data: {
+        customerName: cliente.nome,
+        customerPhone: cliente.telefone || null,
+        customerAddress: cliente.endereco || null,
+        observations: observacoes || null,
+        total,
+        status: 'pending',
+        paymentMethod: 'pix',
+        paymentStatus: 'pending',
+        cartSnapshot: { cliente, itens: items, observacoes: observacoes || null, total },
+        items: { create: orderItems }
+      }
+    });
+
+    // Cria o pagamento PIX no Mercado Pago
+    let pagamento;
+    try {
+      pagamento = await criarPagamentoPixMP({
+        total,
+        descricao: `Pedido #${order.id} - Start Pira`,
+        externalReference: order.id,
+        payer: {
+          email: payer?.email || cliente.email,
+          first_name: cliente.nome
+        }
+      });
+    } catch (mpErr) {
+      // Pagamento não criado: marca o pedido como falho
+      await prisma.order.update({
+        where: { id: order.id },
+        data: { paymentStatus: 'error' }
+      }).catch(() => {});
+      return res.status(502).json({
+        error: 'Não foi possível gerar o PIX',
+        details: mpErr.message
+      });
+    }
+
+    const tx = pagamento?.point_of_interaction?.transaction_data || {};
+
+    // Salva o id do pagamento no pedido
+    await prisma.order.update({
+      where: { id: order.id },
+      data: { paymentId: String(pagamento.id) }
+    });
+
+    res.json({
+      success: true,
+      orderId: order.id,
+      paymentId: pagamento.id,
+      status: pagamento.status, // pending
+      total,
+      qrCode: tx.qr_code || null,            // copia e cola
+      qrCodeBase64: tx.qr_code_base64 || null, // imagem do QR (base64)
+      ticketUrl: tx.ticket_url || null,
+      expiresAt: pagamento.date_of_expiration || null
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao gerar pagamento PIX', details: error.message });
+  }
+});
+
+// GET - Consultar status do pagamento PIX (polling do frontend)
+app.get('/api/pagamento-pix/:orderId/status', async (req, res) => {
+  try {
+    const orderId = parseInt(req.params.orderId);
+    if (isNaN(orderId)) return res.status(400).json({ error: 'ID inválido' });
+
+    let order = await prisma.order.findUnique({ where: { id: orderId } });
+    if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
+
+    // Já aprovado anteriormente
+    if (order.paymentStatus === 'approved') {
+      return res.json({ paid: true, status: 'approved', orderId, whatsappLink: gerarLinkEmpresa(order) });
+    }
+
+    if (!order.paymentId) {
+      return res.json({ paid: false, status: order.paymentStatus || 'pending', orderId });
+    }
+
+    // Consulta o Mercado Pago
+    const pagamento = await consultarPagamentoMP(order.paymentId);
+    const mpStatus = pagamento.status; // pending, approved, rejected, cancelled, ...
+
+    if (mpStatus === 'approved') {
+      order = await processarPagamentoAprovado(order);
+      return res.json({ paid: true, status: 'approved', orderId, whatsappLink: gerarLinkEmpresa(order) });
+    }
+
+    // Atualiza status local (sem baixar estoque)
+    if (mpStatus && mpStatus !== order.paymentStatus) {
+      await prisma.order.update({
+        where: { id: orderId },
+        data: { paymentStatus: mpStatus }
+      }).catch(() => {});
+    }
+
+    res.json({ paid: false, status: mpStatus || 'pending', orderId });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao consultar pagamento', details: error.message });
+  }
+});
+
+// POST - Webhook do Mercado Pago (notificações de pagamento)
+app.post('/api/webhooks/mercadopago', async (req, res) => {
+  // Responde rápido para o Mercado Pago não reenviar.
+  res.sendStatus(200);
+
+  try {
+    // O MP pode enviar { type, data: { id } } no body ou via query (topic/id)
+    const type = req.body?.type || req.query?.type || req.query?.topic;
+    const paymentId = req.body?.data?.id || req.query?.id || req.query['data.id'];
+
+    if (type !== 'payment' || !paymentId) return;
+
+    const pagamento = await consultarPagamentoMP(paymentId);
+    if (pagamento.status !== 'approved') return;
+
+    const orderId = parseInt(pagamento.external_reference);
+    if (isNaN(orderId)) return;
+
+    const order = await prisma.order.findUnique({ where: { id: orderId } });
+    if (!order) return;
+
+    await processarPagamentoAprovado(order);
+    console.log(`Pagamento aprovado via webhook para o pedido #${orderId}`);
+  } catch (error) {
+    console.error('Erro no webhook do Mercado Pago:', error.message);
   }
 });
 
@@ -1178,7 +1600,7 @@ app.put('/api/orders/:id/status', async (req, res) => {
       return res.status(400).json({ error: 'ID do pedido inválido' });
     }
 
-    const validStatuses = ['pending', 'confirmed', 'preparing', 'delivered', 'cancelled'];
+    const validStatuses = ['pending', 'ready', 'out_for_delivery', 'delivered', 'cancelled', 'confirmed', 'preparing'];
     if (!validStatuses.includes(status)) {
       return res.status(400).json({ error: 'Status inválido' });
     }
@@ -1191,7 +1613,10 @@ app.put('/api/orders/:id/status', async (req, res) => {
       }
     });
 
-    res.json(updatedOrder);
+    // Gerar follow-up por WhatsApp para o cliente conforme a nova etapa
+    const followUp = gerarLinkFollowUp(updatedOrder, status);
+
+    res.json({ ...updatedOrder, whatsapp: followUp });
   } catch (error) {
     if (error.code === 'P2025') {
       return res.status(404).json({ error: 'Pedido não encontrado' });
