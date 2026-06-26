@@ -937,7 +937,12 @@ const criarPreferenciaMP = async ({ items, externalReference, payer, backBase })
     throw new Error('MP_ACCESS_TOKEN não configurado no .env');
   }
 
-  const base = (backBase || PUBLIC_API_URL).replace(/\/$/, '');
+  // O Mercado Pago exige back_urls públicas (https) para usar auto_return.
+  // Em dev o frontend manda backBase=localhost, que o MP rejeita; nesse caso
+  // usamos a URL pública desta API como fallback.
+  const ehUrlPublica = (u) => typeof u === 'string' && /^https:\/\//i.test(u) && !/localhost|127\.0\.0\.1/i.test(u);
+  const base = (ehUrlPublica(backBase) ? backBase : PUBLIC_API_URL).replace(/\/$/, '');
+  const podeAutoReturn = ehUrlPublica(base);
   const ref = encodeURIComponent(String(externalReference));
 
   const body = {
@@ -955,7 +960,7 @@ const criarPreferenciaMP = async ({ items, externalReference, payer, backBase })
       pending: `${base}/?pagamento=pendente&pedido=${ref}`,
       failure: `${base}/?pagamento=falha&pedido=${ref}`
     },
-    auto_return: 'approved',
+    ...(podeAutoReturn ? { auto_return: 'approved' } : {}),
     statement_descriptor: 'STARTPIRA',
     ...(payer?.email ? { payer: { email: payer.email, name: payer.first_name || 'Cliente' } } : {})
   };
