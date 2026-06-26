@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import { PrismaClient } from '@prisma/client';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
+import crypto from 'crypto';
 
 dotenv.config();
 
@@ -18,6 +19,7 @@ const QA_API_URL = process.env.QA_API_URL || 'https://api-start-pira-qa.vercel.a
 // ===== Mercado Pago (PIX direto + Checkout Pro) =====
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
 const MP_PUBLIC_KEY = process.env.MP_PUBLIC_KEY || ''; // usada no frontend (Wallet Brick do Checkout Pro)
+const MP_WEBHOOK_SECRET = process.env.MP_WEBHOOK_SECRET || ''; // assinatura das notificacoes (x-signature)
 const MP_API_URL = 'https://api.mercadopago.com';
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${process.env.PORT || 3001}`).replace(/\/$/, '');
 const PIX_EXPIRACAO_MINUTOS = Number(process.env.PIX_EXPIRACAO_MINUTOS) || 30;
@@ -1408,8 +1410,51 @@ app.get('/api/pagamento-pix/:orderId/status', async (req, res) => {
   }
 });
 
+// Valida a assinatura (x-signature) das notificações do Mercado Pago.
+// Retorna true se o segredo não estiver configurado (não bloqueia em dev).
+// Doc: manifest = `id:<data.id>;request-id:<x-request-id>;ts:<ts>;`
+function validarAssinaturaWebhookMP(req) {
+  if (!MP_WEBHOOK_SECRET) return true; // sem segredo configurado, não valida
+
+  const signatureHeader = req.headers['x-signature'];
+  const requestId = req.headers['x-request-id'];
+  if (!signatureHeader) return false;
+
+  // x-signature vem como "ts=1700000000,v1=abc123..."
+  const parts = {};
+  for (const item of String(signatureHeader).split(',')) {
+    const [k, v] = item.split('=');
+    if (k && v) parts[k.trim()] = v.trim();
+  }
+  const ts = parts.ts;
+  const v1 = parts.v1;
+  if (!ts || !v1) return false;
+
+  // data.id deve ser minúsculo se for alfanumérico (regra do MP)
+  let dataId = req.query?.['data.id'] || req.body?.data?.id || req.query?.id || '';
+  dataId = String(dataId).toLowerCase();
+
+  const manifest = `id:${dataId};request-id:${requestId};ts:${ts};`;
+  const esperado = crypto
+    .createHmac('sha256', MP_WEBHOOK_SECRET)
+    .update(manifest)
+    .digest('hex');
+
+  try {
+    return crypto.timingSafeEqual(Buffer.from(esperado), Buffer.from(v1));
+  } catch {
+    return false;
+  }
+}
+
 // POST - Webhook do Mercado Pago (notificações de pagamento)
 app.post('/api/webhooks/mercadopago', async (req, res) => {
+  // Valida a origem da notificação antes de processar.
+  if (!validarAssinaturaWebhookMP(req)) {
+    console.warn('Webhook MP com assinatura inválida — ignorado.');
+    return res.sendStatus(401);
+  }
+
   // Responde rápido para o Mercado Pago não reenviar.
   res.sendStatus(200);
 
