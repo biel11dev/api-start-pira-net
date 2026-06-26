@@ -15,8 +15,9 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
 // URL do sistema interno (fonte da verdade: produtos por componentes, estoque e vendas)
 const QA_API_URL = process.env.QA_API_URL || 'https://api-start-pira-qa.vercel.app';
 
-// ===== Mercado Pago (PIX) =====
+// ===== Mercado Pago (PIX direto + Checkout Pro) =====
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
+const MP_PUBLIC_KEY = process.env.MP_PUBLIC_KEY || ''; // usada no frontend (Wallet Brick do Checkout Pro)
 const MP_API_URL = 'https://api.mercadopago.com';
 const PUBLIC_API_URL = (process.env.PUBLIC_API_URL || `http://localhost:${process.env.PORT || 3001}`).replace(/\/$/, '');
 const PIX_EXPIRACAO_MINUTOS = Number(process.env.PIX_EXPIRACAO_MINUTOS) || 30;
@@ -838,12 +839,12 @@ const normalizarItensPedido = (itens) => (itens || []).map((i) => ({
 }));
 
 // Registra a venda no sistema interno (QA) — dá baixa no estoque.
-// Retorna { ok, status, data }.
-const registrarVendaQA = async (items, total, cliente, _observacoes) => {
+// Marca como pedido ONLINE (origem) para aparecer no gerenciamento do PDV. Retorna { ok, status, data }.
+const registrarVendaQA = async (items, total, cliente, observacoes, metodo) => {
   const saleData = {
     items,
     total,
-    paymentMethod: 'PIX (Mercado Pago)',
+    paymentMethod: metodo || 'PIX (Mercado Pago)',
     customerName: cliente?.nome || 'Cliente',
     amountReceived: total,
     change: 0,
@@ -853,7 +854,13 @@ const registrarVendaQA = async (items, total, cliente, _observacoes) => {
     pendente: null,
     vale: null,
     subtotal: total,
-    finalTotal: total
+    finalTotal: total,
+    // Identifica o pedido como online no sistema interno (sub-aba "Pedidos Online" do PDV)
+    origem: 'ONLINE',
+    statusPedido: 'pending',
+    customerPhone: cliente?.telefone || null,
+    customerAddress: cliente?.endereco || null,
+    observacoes: observacoes || null
   };
 
   const qaRes = await fetch(`${QA_API_URL}/api/sales`, {
@@ -920,6 +927,71 @@ const consultarPagamentoMP = async (paymentId) => {
   return data;
 };
 
+// Cria uma preferência de pagamento (Checkout Pro). Retorna a preferência criada
+// (contém id, init_point e sandbox_init_point). O cliente é direcionado ao checkout
+// do Mercado Pago e a confirmação chega pelo webhook (notification_url).
+const criarPreferenciaMP = async ({ items, externalReference, payer, backBase }) => {
+  if (!MP_ACCESS_TOKEN) {
+    throw new Error('MP_ACCESS_TOKEN não configurado no .env');
+  }
+
+  const base = (backBase || PUBLIC_API_URL).replace(/\/$/, '');
+  const ref = encodeURIComponent(String(externalReference));
+
+  const body = {
+    items: items.map((i) => ({
+      id: String(i.id ?? ''),
+      title: i.composicaoLabel ? `${i.name} — ${i.composicaoLabel}` : i.name,
+      quantity: Number(i.quantity),
+      unit_price: Number(Number(i.price).toFixed(2)),
+      currency_id: 'BRL'
+    })),
+    external_reference: String(externalReference),
+    notification_url: `${PUBLIC_API_URL}/api/webhooks/mercadopago`,
+    back_urls: {
+      success: `${base}/?pagamento=sucesso&pedido=${ref}`,
+      pending: `${base}/?pagamento=pendente&pedido=${ref}`,
+      failure: `${base}/?pagamento=falha&pedido=${ref}`
+    },
+    auto_return: 'approved',
+    statement_descriptor: 'STARTPIRA',
+    ...(payer?.email ? { payer: { email: payer.email, name: payer.first_name || 'Cliente' } } : {})
+  };
+
+  const resp = await fetch(`${MP_API_URL}/checkout/preferences`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${MP_ACCESS_TOKEN}`,
+      'X-Idempotency-Key': `pref-${externalReference}-${Date.now()}`
+    },
+    body: JSON.stringify(body)
+  });
+
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const msg = data?.message || data?.error || 'Erro ao criar preferência de pagamento';
+    const err = new Error(msg);
+    err.details = data;
+    throw err;
+  }
+  return data;
+};
+
+// Consulta um merchant_order no Mercado Pago (usado por notificações do Checkout Pro).
+const consultarMerchantOrderMP = async (merchantOrderId) => {
+  const resp = await fetch(`${MP_API_URL}/merchant_orders/${merchantOrderId}`, {
+    headers: { 'Authorization': `Bearer ${MP_ACCESS_TOKEN}` }
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) {
+    const err = new Error(data?.message || 'Erro ao consultar merchant_order');
+    err.details = data;
+    throw err;
+  }
+  return data;
+};
+
 // Monta a mensagem do pedido para o WhatsApp da empresa (notificação após pagamento)
 const gerarLinkEmpresa = (order) => {
   const snapshot = order.cartSnapshot || {};
@@ -927,7 +999,9 @@ const gerarLinkEmpresa = (order) => {
   const cliente = snapshot.cliente || { nome: order.customerName, telefone: order.customerPhone, endereco: order.customerAddress };
   const total = order.total;
 
-  let mensagem = `*PEDIDO PAGO (PIX) #${order.id}*\n\n`;
+  const metodoLabel = order.paymentMethod === 'checkout_pro' ? 'Mercado Pago (Checkout)' : 'PIX (Mercado Pago)';
+
+  let mensagem = `*PEDIDO PAGO #${order.id}*\n\n`;
   mensagem += `*Cliente:* ${cliente.nome || order.customerName}\n`;
   if (cliente.telefone || order.customerPhone) mensagem += `*Telefone:* ${cliente.telefone || order.customerPhone}\n`;
   if (cliente.endereco || order.customerAddress) mensagem += `*Endereco:* ${cliente.endereco || order.customerAddress}\n`;
@@ -941,7 +1015,7 @@ const gerarLinkEmpresa = (order) => {
   });
 
   mensagem += `\n*VALOR TOTAL: R$ ${Number(total).toFixed(2)}*`;
-  mensagem += `\n\n✅ *Pagamento confirmado via PIX (Mercado Pago)*`;
+  mensagem += `\n\n✅ *Pagamento confirmado via ${metodoLabel}*`;
   if (snapshot.observacoes || order.observations) mensagem += `\n\n*Observacoes:* ${snapshot.observacoes || order.observations}`;
 
   const telefoneEmpresa = process.env.WHATSAPP_NUMBER || '5511999999999';
@@ -958,7 +1032,7 @@ const processarPagamentoAprovado = async (order) => {
   const cliente = snapshot.cliente || { nome: order.customerName };
   const total = order.total;
 
-  const venda = await registrarVendaQA(items, total, cliente, snapshot.observacoes);
+  const venda = await registrarVendaQA(items, total, cliente, snapshot.observacoes, order.paymentMethod === 'checkout_pro' ? 'Mercado Pago (Checkout)' : 'PIX (Mercado Pago)');
   if (!venda.ok) {
     console.error('Falha ao registrar venda no QA após pagamento aprovado:', venda.data);
     // Marca como pago, mas sinaliza que a venda interna falhou (precisa atenção manual).
@@ -1028,7 +1102,13 @@ app.post('/api/pedido-qa', async (req, res) => {
       pendente: null,
       vale: null,
       subtotal: total,
-      finalTotal: total
+      finalTotal: total,
+      // Identifica o pedido como online no sistema interno (sub-aba "Pedidos Online" do PDV)
+      origem: 'ONLINE',
+      statusPedido: 'pending',
+      customerPhone: cliente.telefone || null,
+      customerAddress: cliente.endereco || null,
+      observacoes: observacoes || null
     };
 
     const qaRes = await fetch(`${QA_API_URL}/api/sales`, {
@@ -1200,6 +1280,93 @@ app.post('/api/pagamento-pix', async (req, res) => {
   }
 });
 
+// POST - Criar preferência de pagamento (Checkout Pro)
+app.post('/api/preferencia-mp', async (req, res) => {
+  try {
+    const { cliente, itens, observacoes, payer, backBase } = req.body;
+
+    if (!cliente || !cliente.nome || !Array.isArray(itens) || itens.length === 0) {
+      return res.status(400).json({ error: 'Dados incompletos' });
+    }
+
+    const items = normalizarItensPedido(itens);
+    const total = items.reduce((soma, i) => soma + i.price * i.quantity, 0);
+
+    if (!(total > 0)) {
+      return res.status(400).json({ error: 'Valor total inválido' });
+    }
+
+    const orderItems = [];
+    for (const item of items) {
+      const productId = await resolverProdutoLocal(item.name, item.price);
+      orderItems.push({
+        productId,
+        productName: item.composicaoLabel ? `${item.name} — ${item.composicaoLabel}` : item.name,
+        quantity: item.quantity,
+        unitPrice: item.price,
+        subtotal: item.price * item.quantity
+      });
+    }
+
+    const order = await prisma.order.create({
+      data: {
+        customerName: cliente.nome,
+        customerPhone: cliente.telefone || null,
+        customerAddress: cliente.endereco || null,
+        observations: observacoes || null,
+        total,
+        status: 'pending',
+        paymentMethod: 'checkout_pro',
+        paymentStatus: 'pending',
+        cartSnapshot: { cliente, itens: items, observacoes: observacoes || null, total },
+        items: { create: orderItems }
+      }
+    });
+
+    let preferencia;
+    try {
+      preferencia = await criarPreferenciaMP({
+        items,
+        externalReference: order.id,
+        payer: { email: payer?.email || cliente.email, first_name: cliente.nome },
+        backBase
+      });
+    } catch (mpErr) {
+      await prisma.order.update({
+        where: { id: order.id },
+        data: { paymentStatus: 'error' }
+      }).catch(() => {});
+      return res.status(502).json({
+        error: 'Não foi possível iniciar o checkout do Mercado Pago',
+        details: mpErr.message
+      });
+    }
+
+    // Guarda o id da preferência no snapshot para rastreio (paymentId fica para o webhook)
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        cartSnapshot: {
+          ...(order.cartSnapshot || {}),
+          preferenceId: preferencia.id
+        }
+      }
+    }).catch(() => {});
+
+    res.json({
+      success: true,
+      orderId: order.id,
+      preferenceId: preferencia.id,
+      initPoint: preferencia.init_point || null,
+      sandboxInitPoint: preferencia.sandbox_init_point || null,
+      publicKey: MP_PUBLIC_KEY,
+      total
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao iniciar checkout', details: error.message });
+  }
+});
+
 // GET - Consultar status do pagamento PIX (polling do frontend)
 app.get('/api/pagamento-pix/:orderId/status', async (req, res) => {
   try {
@@ -1249,9 +1416,23 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
   try {
     // O MP pode enviar { type, data: { id } } no body ou via query (topic/id)
     const type = req.body?.type || req.query?.type || req.query?.topic;
-    const paymentId = req.body?.data?.id || req.query?.id || req.query['data.id'];
+    const resourceId = req.body?.data?.id || req.query?.id || req.query['data.id'];
+    if (!resourceId) return;
 
-    if (type !== 'payment' || !paymentId) return;
+    // Descobre o id do pagamento aprovado conforme o tipo de notificação
+    let paymentId = null;
+
+    if (type === 'payment') {
+      paymentId = resourceId;
+    } else if (type === 'merchant_order') {
+      // Checkout Pro: busca os pagamentos da ordem e pega um aprovado
+      const ordem = await consultarMerchantOrderMP(resourceId);
+      const aprovado = (ordem?.payments || []).find((p) => p.status === 'approved');
+      if (!aprovado) return;
+      paymentId = aprovado.id;
+    } else {
+      return;
+    }
 
     const pagamento = await consultarPagamentoMP(paymentId);
     if (pagamento.status !== 'approved') return;
@@ -1261,6 +1442,14 @@ app.post('/api/webhooks/mercadopago', async (req, res) => {
 
     const order = await prisma.order.findUnique({ where: { id: orderId } });
     if (!order) return;
+
+    // Registra o id do pagamento (útil para Checkout Pro, que não o tinha ainda)
+    if (!order.paymentId) {
+      await prisma.order.update({
+        where: { id: orderId },
+        data: { paymentId: String(pagamento.id) }
+      }).catch(() => {});
+    }
 
     await processarPagamentoAprovado(order);
     console.log(`Pagamento aprovado via webhook para o pedido #${orderId}`);
