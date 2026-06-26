@@ -30,31 +30,6 @@ app.use(cors());
 app.use(express.json({ limit: '50mb' }));
 app.use(express.urlencoded({ limit: '50mb', extended: true }));
 
-// Diagnóstico temporário: reporta a PRESENÇA das variáveis de ambiente (nunca o valor).
-// Usado para validar a configuração na Vercel. Remover após o diagnóstico.
-app.get('/api/diag-env', (req, res) => {
-  const info = (v) => {
-    const s = process.env[v];
-    if (s === undefined) return { presente: false };
-    return {
-      presente: true,
-      len: s.length,
-      prefixo: s.slice(0, 8),
-      temAspas: s.includes('"'),
-      temEspacoBorda: s !== s.trim()
-    };
-  };
-  res.json({
-    MP_ACCESS_TOKEN: info('MP_ACCESS_TOKEN'),
-    MP_PUBLIC_KEY: info('MP_PUBLIC_KEY'),
-    MP_WEBHOOK_SECRET: info('MP_WEBHOOK_SECRET'),
-    PUBLIC_API_URL: info('PUBLIC_API_URL'),
-    PIX_EXPIRACAO_MINUTOS: info('PIX_EXPIRACAO_MINUTOS'),
-    QA_API_URL: info('QA_API_URL'),
-    DATABASE_URL: info('DATABASE_URL')
-  });
-});
-
 // Middleware de autenticação
 const authenticateToken = (req, res, next) => {
   const authHeader = req.headers['authorization'];
