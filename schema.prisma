@@ -46,6 +46,28 @@ model Product {
   @@map("products")
 }
 
+// Tabela de Clientes (contas do site público Start-Pira-Net)
+model Customer {
+  id             Int       @id @default(autoincrement())
+  firstName      String
+  lastName       String?
+  email          String    @unique
+  phone          String?
+  cpf            String?   @unique
+  passwordHash   String?   // null quando a conta é apenas Google
+  googleId       String?   @unique // sub do Google (contas via OAuth)
+  avatarUrl      String?
+  provider       String    @default("local") // "local" | "google"
+  acceptedTerms  Boolean   @default(false)
+  acceptedTermsAt DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  orders         Order[]
+
+  @@map("customers")
+}
+
 // Tabela de Pedidos
 model Order {
   id           Int         @id @default(autoincrement())
@@ -55,6 +77,10 @@ model Order {
   observations String?
   total        Float
   status       String      @default("pending") // pending, ready, out_for_delivery, delivered, cancelled
+
+  // Vínculo com a conta do cliente (opcional para compatibilidade com pedidos antigos)
+  customerId   Int?
+  customer     Customer?   @relation(fields: [customerId], references: [id])
 
   // Pagamento (Mercado Pago PIX)
   paymentMethod  String?   // ex: "pix"

@@ -5,6 +5,8 @@ import { PrismaClient } from '@prisma/client';
 import jwt from 'jsonwebtoken';
 import bcrypt from 'bcryptjs';
 import crypto from 'crypto';
+import nodemailer from 'nodemailer';
+import { OAuth2Client } from 'google-auth-library';
 
 dotenv.config();
 
@@ -15,6 +17,13 @@ const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
 
 // URL do sistema interno (fonte da verdade: produtos por componentes, estoque e vendas)
 const QA_API_URL = process.env.QA_API_URL || 'https://api-start-pira-qa.vercel.app';
+
+// ===== Contas de cliente (site público) =====
+const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://start-pira-net.vercel.app').replace(/\/$/, '');
+const EMAIL_USER = process.env.EMAIL_USER || '';
+const EMAIL_PASS = process.env.EMAIL_PASS || '';
+const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID || '';
+const googleClient = GOOGLE_CLIENT_ID ? new OAuth2Client(GOOGLE_CLIENT_ID) : null;
 
 // ===== Mercado Pago (PIX direto + Checkout Pro) =====
 const MP_ACCESS_TOKEN = process.env.MP_ACCESS_TOKEN || '';
@@ -105,6 +114,330 @@ app.post('/api/auth/login', async (req, res) => {
 // GET - Verificar token
 app.get('/api/auth/me', authenticateToken, (req, res) => {
   res.json({ user: req.user });
+});
+
+
+// ============================================
+// ROTAS DE AUTENTICAÇÃO DE CLIENTES (site público)
+// ============================================
+
+// Middleware de autenticação de cliente (JWT com type: 'customer')
+const authenticateCustomer = (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+  if (!token) {
+    return res.status(401).json({ error: 'Não autenticado' });
+  }
+  jwt.verify(token, JWT_SECRET, (err, payload) => {
+    if (err || payload?.type !== 'customer') {
+      return res.status(403).json({ error: 'Sessão inválida' });
+    }
+    req.customer = payload;
+    next();
+  });
+};
+
+// Remove apenas os dígitos de um texto (para CPF/telefone)
+const somenteDigitos = (v) => String(v || '').replace(/\D/g, '');
+const cpfValido = (cpf) => {
+  const s = somenteDigitos(cpf);
+  if (s.length !== 11 || /^(\d)\1{10}$/.test(s)) return false;
+  let soma = 0;
+  for (let i = 0; i < 9; i++) soma += parseInt(s[i]) * (10 - i);
+  let d1 = (soma * 10) % 11;
+  if (d1 === 10) d1 = 0;
+  if (d1 !== parseInt(s[9])) return false;
+  soma = 0;
+  for (let i = 0; i < 10; i++) soma += parseInt(s[i]) * (11 - i);
+  let d2 = (soma * 10) % 11;
+  if (d2 === 10) d2 = 0;
+  return d2 === parseInt(s[10]);
+};
+
+const emailValido = (email) => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(String(email || '').trim());
+
+// Serializa o cliente para o frontend (nunca expõe passwordHash)
+const serializarCliente = (c) => ({
+  id: c.id,
+  firstName: c.firstName,
+  lastName: c.lastName || '',
+  email: c.email,
+  phone: c.phone || '',
+  cpf: c.cpf || '',
+  avatarUrl: c.avatarUrl || '',
+  provider: c.provider
+});
+
+// Gera o token de sessão do cliente
+const gerarTokenCliente = (c) =>
+  jwt.sign({ id: c.id, email: c.email, type: 'customer' }, JWT_SECRET, { expiresIn: '30d' });
+
+// Extrai (opcionalmente) o id do cliente logado a partir do header Authorization.
+// Retorna null quando não há token ou o token não é de cliente — sem lançar erro.
+const clienteOpcional = (req) => {
+  try {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return null;
+    const payload = jwt.verify(token, JWT_SECRET);
+    return payload?.type === 'customer' ? payload.id : null;
+  } catch {
+    return null;
+  }
+};
+
+// Envia o e-mail de redefinição de senha (mesmo padrão da API QA)
+const enviarEmailReset = async (email, token, nome) => {
+  if (!EMAIL_USER || !EMAIL_PASS) {
+    throw new Error('Serviço de e-mail não configurado (EMAIL_USER/EMAIL_PASS)');
+  }
+  const transporter = nodemailer.createTransport({
+    host: 'smtp.gmail.com',
+    port: 587,
+    secure: false,
+    auth: { user: EMAIL_USER, pass: EMAIL_PASS }
+  });
+
+  const resetLink = `${FRONTEND_URL}/redefinir-senha?token=${token}`;
+  await transporter.sendMail({
+    from: `"Start Pira" <${EMAIL_USER}>`,
+    to: email,
+    subject: 'Redefinição de Senha - Start Pira',
+    text: `Olá${nome ? ' ' + nome : ''},\n\nVocê solicitou a redefinição da sua senha. Use o link abaixo (válido por 1 hora):\n\n${resetLink}\n\nSe não foi você, ignore este e-mail.\n\nEquipe Start Pira`,
+    html: `<div style="font-family:Arial,sans-serif;max-width:480px;margin:auto">
+      <h2 style="color:#dc143c">Start Pira</h2>
+      <p>Olá${nome ? ' <strong>' + nome + '</strong>' : ''},</p>
+      <p>Você solicitou a redefinição da sua senha. Clique no botão abaixo (o link é válido por 1 hora):</p>
+      <p style="text-align:center;margin:24px 0">
+        <a href="${resetLink}" style="background:#dc143c;color:#fff;padding:12px 24px;border-radius:8px;text-decoration:none;display:inline-block">Redefinir senha</a>
+      </p>
+      <p style="font-size:12px;color:#666">Se não foi você, ignore este e-mail. Sua senha continuará a mesma.</p>
+    </div>`
+  });
+};
+
+// POST - Cadastro de cliente (manual)
+app.post('/api/customer/register', async (req, res) => {
+  try {
+    const { firstName, lastName, email, phone, cpf, password, acceptedTerms } = req.body;
+
+    if (!firstName || !String(firstName).trim()) {
+      return res.status(400).json({ error: 'Informe o nome' });
+    }
+    if (!emailValido(email)) {
+      return res.status(400).json({ error: 'E-mail inválido' });
+    }
+    if (!password || String(password).length < 6) {
+      return res.status(400).json({ error: 'A senha deve ter ao menos 6 caracteres' });
+    }
+    if (!acceptedTerms) {
+      return res.status(400).json({ error: 'É necessário aceitar os termos e condições' });
+    }
+    if (cpf && !cpfValido(cpf)) {
+      return res.status(400).json({ error: 'CPF inválido' });
+    }
+
+    const emailNorm = String(email).trim().toLowerCase();
+    const cpfNorm = cpf ? somenteDigitos(cpf) : null;
+
+    const existente = await prisma.customer.findFirst({
+      where: { OR: [{ email: emailNorm }, ...(cpfNorm ? [{ cpf: cpfNorm }] : [])] }
+    });
+    if (existente) {
+      const campo = existente.email === emailNorm ? 'e-mail' : 'CPF';
+      return res.status(409).json({ error: `Já existe uma conta com este ${campo}` });
+    }
+
+    const passwordHash = await bcrypt.hash(String(password), 10);
+    const cliente = await prisma.customer.create({
+      data: {
+        firstName: String(firstName).trim(),
+        lastName: lastName ? String(lastName).trim() : null,
+        email: emailNorm,
+        phone: phone ? somenteDigitos(phone) : null,
+        cpf: cpfNorm,
+        passwordHash,
+        provider: 'local',
+        acceptedTerms: true,
+        acceptedTermsAt: new Date()
+      }
+    });
+
+    const token = gerarTokenCliente(cliente);
+    res.status(201).json({ token, customer: serializarCliente(cliente) });
+  } catch (error) {
+    console.error('Erro no cadastro de cliente:', error);
+    res.status(500).json({ error: 'Erro ao criar conta', details: error.message });
+  }
+});
+
+// POST - Login de cliente (e-mail + senha)
+app.post('/api/customer/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+    if (!emailValido(email) || !password) {
+      return res.status(400).json({ error: 'Informe e-mail e senha' });
+    }
+    const emailNorm = String(email).trim().toLowerCase();
+    const cliente = await prisma.customer.findUnique({ where: { email: emailNorm } });
+    if (!cliente || !cliente.passwordHash) {
+      return res.status(401).json({ error: 'E-mail ou senha inválidos' });
+    }
+    const ok = await bcrypt.compare(String(password), cliente.passwordHash);
+    if (!ok) {
+      return res.status(401).json({ error: 'E-mail ou senha inválidos' });
+    }
+    const token = gerarTokenCliente(cliente);
+    res.json({ token, customer: serializarCliente(cliente) });
+  } catch (error) {
+    console.error('Erro no login de cliente:', error);
+    res.status(500).json({ error: 'Erro ao fazer login', details: error.message });
+  }
+});
+
+// POST - Login/cadastro via Google (recebe o credential/ID token do Google Identity Services)
+app.post('/api/customer/google', async (req, res) => {
+  try {
+    if (!googleClient) {
+      return res.status(500).json({ error: 'Login com Google não configurado (GOOGLE_CLIENT_ID)' });
+    }
+    const { credential } = req.body;
+    if (!credential) {
+      return res.status(400).json({ error: 'Credencial do Google ausente' });
+    }
+
+    const ticket = await googleClient.verifyIdToken({ idToken: credential, audience: GOOGLE_CLIENT_ID });
+    const payload = ticket.getPayload();
+    if (!payload?.email) {
+      return res.status(401).json({ error: 'Não foi possível validar a conta Google' });
+    }
+
+    const emailNorm = payload.email.trim().toLowerCase();
+    let cliente = await prisma.customer.findFirst({
+      where: { OR: [{ googleId: payload.sub }, { email: emailNorm }] }
+    });
+
+    if (!cliente) {
+      cliente = await prisma.customer.create({
+        data: {
+          firstName: payload.given_name || payload.name || 'Cliente',
+          lastName: payload.family_name || null,
+          email: emailNorm,
+          googleId: payload.sub,
+          avatarUrl: payload.picture || null,
+          provider: 'google',
+          acceptedTerms: true,
+          acceptedTermsAt: new Date()
+        }
+      });
+    } else if (!cliente.googleId) {
+      // Vincula a conta Google a um cadastro existente com o mesmo e-mail
+      cliente = await prisma.customer.update({
+        where: { id: cliente.id },
+        data: {
+          googleId: payload.sub,
+          avatarUrl: cliente.avatarUrl || payload.picture || null
+        }
+      });
+    }
+
+    const token = gerarTokenCliente(cliente);
+    res.json({ token, customer: serializarCliente(cliente) });
+  } catch (error) {
+    console.error('Erro no login Google:', error);
+    res.status(500).json({ error: 'Erro ao autenticar com Google', details: error.message });
+  }
+});
+
+// GET - Dados do cliente autenticado
+app.get('/api/customer/me', authenticateCustomer, async (req, res) => {
+  try {
+    const cliente = await prisma.customer.findUnique({ where: { id: req.customer.id } });
+    if (!cliente) return res.status(404).json({ error: 'Conta não encontrada' });
+    res.json({ customer: serializarCliente(cliente) });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao carregar conta', details: error.message });
+  }
+});
+
+// POST - Solicitar redefinição de senha
+app.post('/api/customer/forgot-password', async (req, res) => {
+  try {
+    const { email } = req.body;
+    if (!emailValido(email)) {
+      return res.status(400).json({ error: 'E-mail inválido' });
+    }
+    const emailNorm = String(email).trim().toLowerCase();
+    const cliente = await prisma.customer.findUnique({ where: { email: emailNorm } });
+
+    // Resposta genérica para não revelar se o e-mail existe
+    const respostaGenerica = { message: 'Se houver uma conta com este e-mail, enviaremos as instruções de redefinição.' };
+
+    if (!cliente || !cliente.passwordHash) {
+      // Conta inexistente ou só-Google (sem senha): não envia, mas responde igual
+      return res.json(respostaGenerica);
+    }
+
+    const token = jwt.sign({ id: cliente.id, email: cliente.email, type: 'reset' }, JWT_SECRET, { expiresIn: '1h' });
+    await enviarEmailReset(cliente.email, token, cliente.firstName);
+    res.json(respostaGenerica);
+  } catch (error) {
+    console.error('Erro no forgot-password:', error);
+    res.status(500).json({ error: 'Erro ao enviar e-mail de redefinição', details: error.message });
+  }
+});
+
+// POST - Validar token de redefinição
+app.post('/api/customer/validate-reset-token', (req, res) => {
+  try {
+    const { token } = req.body;
+    const payload = jwt.verify(token, JWT_SECRET);
+    if (payload?.type !== 'reset') {
+      return res.status(400).json({ error: 'Token inválido' });
+    }
+    res.json({ valid: true, email: payload.email });
+  } catch {
+    res.status(400).json({ error: 'Token inválido ou expirado' });
+  }
+});
+
+// POST - Redefinir senha
+app.post('/api/customer/reset-password', async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!newPassword || String(newPassword).length < 6) {
+      return res.status(400).json({ error: 'A senha deve ter ao menos 6 caracteres' });
+    }
+    let payload;
+    try {
+      payload = jwt.verify(token, JWT_SECRET);
+    } catch {
+      return res.status(400).json({ error: 'Token inválido ou expirado' });
+    }
+    if (payload?.type !== 'reset') {
+      return res.status(400).json({ error: 'Token inválido' });
+    }
+    const passwordHash = await bcrypt.hash(String(newPassword), 10);
+    await prisma.customer.update({ where: { id: payload.id }, data: { passwordHash } });
+    res.json({ message: 'Senha redefinida com sucesso' });
+  } catch (error) {
+    console.error('Erro no reset-password:', error);
+    res.status(500).json({ error: 'Erro ao redefinir senha', details: error.message });
+  }
+});
+
+// GET - Histórico de pedidos do cliente autenticado
+app.get('/api/customer/orders', authenticateCustomer, async (req, res) => {
+  try {
+    const pedidos = await prisma.order.findMany({
+      where: { customerId: req.customer.id },
+      orderBy: { createdAt: 'desc' },
+      include: { items: true }
+    });
+    res.json(pedidos);
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao carregar pedidos', details: error.message });
+  }
 });
 
 
@@ -1229,6 +1562,7 @@ app.post('/api/pagamento-pix', async (req, res) => {
         customerName: cliente.nome,
         customerPhone: cliente.telefone || null,
         customerAddress: cliente.endereco || null,
+        customerId: clienteOpcional(req),
         observations: observacoes || null,
         total,
         status: 'pending',
@@ -1320,6 +1654,7 @@ app.post('/api/preferencia-mp', async (req, res) => {
         customerName: cliente.nome,
         customerPhone: cliente.telefone || null,
         customerAddress: cliente.endereco || null,
+        customerId: clienteOpcional(req),
         observations: observacoes || null,
         total,
         status: 'pending',
@@ -1412,6 +1747,46 @@ app.get('/api/pagamento-pix/:orderId/status', async (req, res) => {
     res.json({ paid: false, status: mpStatus || 'pending', orderId });
   } catch (error) {
     res.status(500).json({ error: 'Erro ao consultar pagamento', details: error.message });
+  }
+});
+
+// GET - Recupera os dados de um pedido pelo id (usado no retorno do Checkout Pro,
+// quando o snapshot do carrinho é perdido após o redirecionamento/recarregamento).
+app.get('/api/pedido/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id);
+    if (isNaN(id)) return res.status(400).json({ error: 'ID inválido' });
+
+    const order = await prisma.order.findUnique({
+      where: { id },
+      include: { items: true }
+    });
+    if (!order) return res.status(404).json({ error: 'Pedido não encontrado' });
+
+    const snapshot = order.cartSnapshot || {};
+    res.json({
+      id: order.id,
+      status: order.status,
+      paymentMethod: order.paymentMethod,
+      paymentStatus: order.paymentStatus,
+      paid: order.paymentStatus === 'approved',
+      total: order.total,
+      cliente: snapshot.cliente || {
+        nome: order.customerName,
+        telefone: order.customerPhone || '',
+        endereco: order.customerAddress || ''
+      },
+      itens: snapshot.itens || order.items.map(i => ({
+        name: i.productName,
+        price: i.unitPrice,
+        quantity: i.quantity
+      })),
+      observacoes: order.observations || '',
+      whatsappLink: order.paymentStatus === 'approved' ? gerarLinkEmpresa(order) : null,
+      createdAt: order.createdAt
+    });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao carregar pedido', details: error.message });
   }
 });
 
