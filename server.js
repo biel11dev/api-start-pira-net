@@ -427,6 +427,40 @@ app.post('/api/customer/reset-password', async (req, res) => {
 });
 
 // GET - Histórico de pedidos do cliente autenticado
+// Sincroniza o andamento (statusPedido) dos pedidos pagos com o sistema interno (QA)
+const STATUS_PEDIDO_TERMINAIS = new Set(['delivered', 'cancelled']);
+const sincronizarStatusPedidosQA = async (pedidos) => {
+  const paraSincronizar = pedidos.filter((p) => p.qaSaleId && !STATUS_PEDIDO_TERMINAIS.has(p.status));
+  if (paraSincronizar.length === 0) return pedidos;
+
+  const ids = paraSincronizar
+    .map((p) => parseInt(p.qaSaleId, 10))
+    .filter((n) => Number.isInteger(n));
+  if (ids.length === 0) return pedidos;
+
+  try {
+    const resp = await fetch(`${QA_API_URL}/api/sales/status?ids=${ids.join(',')}`);
+    if (!resp.ok) return pedidos;
+    const lista = await resp.json();
+    const mapa = new Map((Array.isArray(lista) ? lista : []).map((s) => [String(s.id), s.statusPedido]));
+
+    await Promise.all(
+      paraSincronizar.map(async (pedido) => {
+        const novoStatus = mapa.get(String(pedido.qaSaleId));
+        if (novoStatus && novoStatus !== pedido.status) {
+          pedido.status = novoStatus; // reflete no objeto retornado ao cliente
+          await prisma.order
+            .update({ where: { id: pedido.id }, data: { status: novoStatus } })
+            .catch(() => {});
+        }
+      })
+    );
+  } catch (e) {
+    console.debug('Sync status QA:', e.message);
+  }
+  return pedidos;
+};
+
 app.get('/api/customer/orders', authenticateCustomer, async (req, res) => {
   try {
     const pedidos = await prisma.order.findMany({
@@ -434,6 +468,7 @@ app.get('/api/customer/orders', authenticateCustomer, async (req, res) => {
       orderBy: { createdAt: 'desc' },
       include: { items: true }
     });
+    await sincronizarStatusPedidosQA(pedidos);
     res.json(pedidos);
   } catch (error) {
     res.status(500).json({ error: 'Erro ao carregar pedidos', details: error.message });
