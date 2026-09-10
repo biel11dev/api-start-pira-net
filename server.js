@@ -1026,6 +1026,8 @@ const mapearComposicoes = (item) => (item.composicoes || []).map(c => ({
   multiplo: c.multiplo,
   minOpcoes: c.minOpcoes,
   maxOpcoes: c.maxOpcoes,
+  porcoesGratis: c.porcoesGratis,
+  valorAdicional: c.valorAdicional,
   ordem: c.ordem,
   opcoes: (c.opcoes || [])
     .filter(o => o.disponivel)
