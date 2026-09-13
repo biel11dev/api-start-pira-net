@@ -1044,7 +1044,12 @@ const mapearComposicoes = (item) => (item.composicoes || []).map(c => ({
 // dentro da hierarquia categoria > subcategoria
 const agruparCardapioQA = (estoqueItems, imageMap = {}) => {
   // Excluir itens que são apenas componentes de composição (vinculados via composicaoOpcoes)
-  const vendiveis = estoqueItems.filter(p => !(p._count?.composicaoOpcoes > 0));
+  // e unidades marcadas como NÃO comercializáveis na base de cadastro do QA
+  // (product.pdvHiddenUnits — ex.: "Massa Pastel", usada só p/ estoque/conversão).
+  const vendiveis = estoqueItems.filter(p =>
+    !(p._count?.composicaoOpcoes > 0) &&
+    !((p.product?.pdvHiddenUnits || []).includes(p.unit))
+  );
 
   // Agrupar itens de estoque pelo mesmo productId (mesmo produto, unidades diferentes)
   const produtoGroups = new Map();
