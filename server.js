@@ -16,7 +16,7 @@ const PORT = process.env.PORT || 3001;
 const JWT_SECRET = process.env.JWT_SECRET || 'fallback-secret-key';
 
 // URL do sistema interno (fonte da verdade: produtos por componentes, estoque e vendas)
-const QA_API_URL = process.env.QA_API_URL || 'https://api-start-pira-qa.vercel.app';
+const QA_API_URL = process.env.QA_API_URL || 'https://api-start-pira.vercel.app';
 
 // ===== Contas de cliente (site público) =====
 const FRONTEND_URL = (process.env.FRONTEND_URL || 'https://start-pira-net.vercel.app').replace(/\/$/, '');
@@ -1216,8 +1216,15 @@ const normalizarItensPedido = (itens) => (itens || []).map((i) => ({
 }));
 
 // Registra a venda no sistema interno (QA) — dá baixa no estoque.
-// Marca como pedido ONLINE (origem) para aparecer no gerenciamento do PDV. Retorna { ok, status, data }.
-const registrarVendaQA = async (items, total, cliente, observacoes, metodo) => {
+// Marca como pedido ONLINE (origem) para aparecer no gerenciamento do PDV. Retorna { ok, status, data, offline? }.
+const TIMEOUT_API_INTERNA_MS = 8000;
+const fetchComTimeout = (url, opcoes, timeoutMs) => {
+  const controlador = new AbortController();
+  const timer = setTimeout(() => controlador.abort(), timeoutMs);
+  return fetch(url, { ...opcoes, signal: controlador.signal }).finally(() => clearTimeout(timer));
+};
+
+const registrarVendaQA = async (items, total, cliente, observacoes, metodo, chaveIdempotencia) => {
   const saleData = {
     items,
     total,
@@ -1240,11 +1247,20 @@ const registrarVendaQA = async (items, total, cliente, observacoes, metodo) => {
     observacoes: observacoes || null
   };
 
-  const qaRes = await fetch(`${QA_API_URL}/api/sales`, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(saleData)
-  });
+  // A mesma chave em reenvios impede venda duplicada se a 1ª tentativa chegou ao sistema interno mas a resposta se perdeu.
+  const resposta = await fetchComTimeout(`${QA_API_URL}/api/sales`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(chaveIdempotencia ? { 'X-Idempotency-Key': chaveIdempotencia } : {})
+      },
+      body: JSON.stringify(saleData)
+    }, TIMEOUT_API_INTERNA_MS).catch((erro) => ({ falhaDeRede: erro }));
+  // API interna fora do ar/sem resposta: o pedido não é perdido, fica pendente para reenvio.
+  if (resposta.falhaDeRede) {
+    return { ok: false, status: 0, offline: true, data: { error: resposta.falhaDeRede.message } };
+  }
+  const qaRes = resposta;
   const data = await qaRes.json().catch(() => ({}));
   return { ok: qaRes.ok, status: qaRes.status, data };
 };
@@ -1414,13 +1430,16 @@ const processarPagamentoAprovado = async (order) => {
   const cliente = snapshot.cliente || { nome: order.customerName };
   const total = order.total;
 
-  const venda = await registrarVendaQA(items, total, cliente, snapshot.observacoes, order.paymentMethod === 'checkout_pro' ? 'Mercado Pago (Checkout)' : 'PIX (Mercado Pago)');
+  const venda = await registrarVendaQA(items, total, cliente, snapshot.observacoes, order.paymentMethod === 'checkout_pro' ? 'Mercado Pago (Checkout)' : 'PIX (Mercado Pago)', `net-order-${order.id}`);
   if (!venda.ok) {
     console.error('Falha ao registrar venda no QA após pagamento aprovado:', venda.data);
-    // Marca como pago, mas sinaliza que a venda interna falhou (precisa atenção manual).
+    // Marca como pago e guarda a pendência; reenviarVendasPendentesQA() tenta de novo automaticamente.
     return prisma.order.update({
       where: { id: order.id },
-      data: { paymentStatus: 'approved' }
+      data: {
+        paymentStatus: 'approved',
+        cartSnapshot: { ...snapshot, integracao: { tentativas: 1, ultimoErro: venda.data?.error || null, em: new Date().toISOString() } }
+      }
     });
   }
 
@@ -1434,19 +1453,95 @@ const processarPagamentoAprovado = async (order) => {
 };
 
 // GET - Cardápio público consumindo o sistema interno (produtos por componentes)
+// Pedidos pagos (ou feitos sem pagamento online) cuja venda não chegou ao sistema interno, por ele estar fora do ar,
+// são reenviados em ordem; a chave de idempotência evita duplicar a venda.
+const MAX_TENTATIVAS_INTEGRACAO = 30;
+const INTERVALO_REENVIO_MS = 2 * 60 * 1000;
+let reenviandoPendentes = false;
+let ultimoReenvioPendentes = 0;
+
+const rotuloMetodoPedido = (order) => {
+  if (order.paymentMethod === 'pedido_online') return 'Pedido Online';
+  return order.paymentMethod === 'checkout_pro' ? 'Mercado Pago (Checkout)' : 'PIX (Mercado Pago)';
+};
+
+const reenviarVendasPendentesQA = async () => {
+  if (reenviandoPendentes) return 0;
+  reenviandoPendentes = true;
+  let integrados = 0;
+  try {
+    const desde = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+    const candidatos = await prisma.order.findMany({
+      where: {
+        createdAt: { gte: desde },
+        AND: [
+          { OR: [{ qaSaleId: null }, { qaSaleId: '' }] },
+          { OR: [{ paymentStatus: 'approved' }, { paymentMethod: 'pedido_online' }] }
+        ]
+      },
+      orderBy: { createdAt: 'asc' },
+      take: 5
+    });
+
+    for (const order of candidatos) {
+      const snapshot = order.cartSnapshot || {};
+      const itens = snapshot.itens || [];
+      const tentativas = snapshot.integracao?.tentativas || 0;
+      if (!itens.length || tentativas >= MAX_TENTATIVAS_INTEGRACAO) continue;
+
+      const venda = await registrarVendaQA(
+        itens, order.total, snapshot.cliente || { nome: order.customerName },
+        snapshot.observacoes, rotuloMetodoPedido(order), snapshot.chaveIdempotencia || `net-order-${order.id}`
+      );
+      if (venda.ok) {
+        await prisma.order.update({
+          where: { id: order.id },
+          data: { qaSaleId: String(venda.data?.id ?? '') }
+        });
+        integrados += 1;
+      } else {
+        await prisma.order.update({
+          where: { id: order.id },
+          data: { cartSnapshot: { ...snapshot, integracao: { tentativas: tentativas + 1, ultimoErro: venda.data?.error || null, em: new Date().toISOString() } } }
+        });
+        // API interna ainda fora do ar: não adianta insistir nos demais agora.
+        if (venda.offline) break;
+      }
+    }
+  } finally {
+    reenviandoPendentes = false;
+  }
+  return integrados;
+};
+
+// Dispara o reenvio sem esperar (no máximo uma vez a cada 2 min).
+const agendarReenvioPendentes = () => {
+  if (Date.now() - ultimoReenvioPendentes < INTERVALO_REENVIO_MS) return;
+  ultimoReenvioPendentes = Date.now();
+  reenviarVendasPendentesQA().catch((e) => console.error('Reenvio de pedidos pendentes:', e.message));
+};
+setInterval(agendarReenvioPendentes, INTERVALO_REENVIO_MS);
+
+// Cache em memória do último cardápio obtido, usado se o sistema interno estiver fora do ar.
+let ultimoCardapioQA = null;
+
 app.get('/api/cardapio-qa', async (req, res) => {
+  agendarReenvioPendentes();
   try {
     const [response, imageMap] = await Promise.all([
-      fetch(`${QA_API_URL}/api/estoque_prod`),
+      fetchComTimeout(`${QA_API_URL}/api/estoque_prod`, {}, TIMEOUT_API_INTERNA_MS),
       carregarImagensLocais()
     ]);
-    if (!response.ok) {
-      return res.status(502).json({ error: 'Não foi possível obter o cardápio do sistema interno' });
-    }
+    if (!response.ok) throw new Error(`Sistema interno respondeu ${response.status}`);
     const estoque = await response.json();
-    res.json(agruparCardapioQA(estoque, imageMap));
+    ultimoCardapioQA = agruparCardapioQA(estoque, imageMap);
+    res.json(ultimoCardapioQA);
   } catch (error) {
-    res.status(500).json({ error: 'Erro ao buscar cardápio do sistema interno', details: error.message });
+    if (ultimoCardapioQA) {
+      res.set('X-Cardapio-Cache', 'stale');
+      return res.json(ultimoCardapioQA);
+    }
+    res.status(502).json({ error: 'Não foi possível obter o cardápio do sistema interno', details: error.message });
   }
 });
 
@@ -1471,37 +1566,16 @@ app.post('/api/pedido-qa', async (req, res) => {
 
     const total = items.reduce((soma, i) => soma + i.price * i.quantity, 0);
 
-    const saleData = {
-      items,
-      total,
-      paymentMethod: 'Pedido Online',
-      customerName: cliente.nome,
-      amountReceived: total,
-      change: 0,
-      date: new Date().toISOString(),
-      discount: null,
-      splitPayments: null,
-      pendente: null,
-      vale: null,
-      subtotal: total,
-      finalTotal: total,
-      // Identifica o pedido como online no sistema interno (sub-aba "Pedidos Online" do PDV)
-      origem: 'ONLINE',
-      statusPedido: 'pending',
-      customerPhone: cliente.telefone || null,
-      customerAddress: cliente.endereco || null,
-      observacoes: observacoes || null
-    };
+    // Chave única deste pedido: reenvios ao sistema interno não duplicam a venda.
+    const chaveIdempotencia = `net-pedido-${crypto.randomUUID()}`;
+    const venda = await registrarVendaQA(items, total, cliente, observacoes, 'Pedido Online', chaveIdempotencia);
+    const data = venda.data || {};
 
-    const qaRes = await fetch(`${QA_API_URL}/api/sales`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(saleData)
-    });
-    const data = await qaRes.json();
-
-    if (!qaRes.ok) {
-      return res.status(qaRes.status).json({
+    // Sistema interno fora do ar (sem resposta ou erro 5xx): o pedido é guardado e enviado depois;
+    // o cliente segue pelo WhatsApp e a loja continua o atendimento manualmente.
+    const integracaoPendente = !venda.ok && (venda.offline || venda.status >= 500);
+    if (!venda.ok && !integracaoPendente) {
+      return res.status(venda.status).json({
         error: data.error || 'Erro ao registrar pedido no sistema interno'
       });
     }
@@ -1529,11 +1603,19 @@ app.post('/api/pedido-qa', async (req, res) => {
           observations: observacoes || null,
           total,
           status: 'pending',
+          paymentMethod: 'pedido_online',
+          qaSaleId: integracaoPendente ? null : String(data.id ?? ''),
+          cartSnapshot: { cliente, itens: items, observacoes: observacoes || null, total, chaveIdempotencia },
           items: { create: orderItems }
         }
       });
     } catch (orderErr) {
       console.error('Não foi possível criar o Order de rastreamento no net:', orderErr.message);
+    }
+
+    // Sem registro em lugar nenhum o pedido seria perdido: avisa o cliente em vez de confirmar.
+    if (integracaoPendente && !netOrder) {
+      return res.status(503).json({ error: 'Sistema indisponível no momento. Tente novamente em instantes.' });
     }
 
     // Montar mensagem para WhatsApp
@@ -1559,10 +1641,11 @@ app.post('/api/pedido-qa', async (req, res) => {
     res.json({
       success: true,
       orderId: netOrder?.id ?? data.id,
-      saleId: data.id,
+      saleId: data.id ?? null,
       total,
       whatsappLink,
-      mensagem
+      mensagem,
+      integracaoPendente
     });
   } catch (error) {
     res.status(500).json({ error: 'Erro ao registrar pedido no sistema interno', details: error.message });
@@ -2375,13 +2458,30 @@ app.delete('/api/sugestoes/:id', async (req, res) => {
 // ROTAS AUXILIARES
 // ============================================
 
-// Rota de health check
-app.get('/health', (req, res) => {
+// Rota de health check (também tenta reenviar pedidos que ficaram pendentes de integração)
+app.get('/health', async (req, res) => {
+  let integrados = 0;
+  try {
+    integrados = await reenviarVendasPendentesQA();
+  } catch (e) {
+    console.error('Reenvio de pedidos pendentes:', e.message);
+  }
   res.json({ 
     status: 'OK', 
     message: 'API de Pedidos Online funcionando!',
-    database: 'Connected with Prisma'
+    database: 'Connected with Prisma',
+    pedidosIntegrados: integrados
   });
+});
+
+// POST - Reenvio manual dos pedidos pendentes de integração com o sistema interno
+app.post('/api/pedidos/reenviar-pendentes', async (req, res) => {
+  try {
+    const integrados = await reenviarVendasPendentesQA();
+    res.json({ integrados });
+  } catch (error) {
+    res.status(500).json({ error: 'Erro ao reenviar pedidos pendentes', details: error.message });
+  }
 });
 
 // ============================================
